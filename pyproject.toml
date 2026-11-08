@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edge-log-shipper"
+version = "1.0.0"
+description = "Zero-dependency edge log streaming daemon with store-and-forward spooling, CWE-117 sanitization, and WireGuard mesh support."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Ethan Kilmer", email = "ethan@twu.software"}
+]
+keywords = [
+    "syslog",
+    "edge",
+    "iot",
+    "wireguard",
+    "log-shipper",
+    "cwe-117",
+    "store-and-forward",
+    "spooler",
+    "rfc5424",
+    "audit",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Networking",
+    "Topic :: Security",
+]
+dependencies = []
+
+[project.scripts]
+edgeshipper = "edgeshipper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edgeshipper*"]
