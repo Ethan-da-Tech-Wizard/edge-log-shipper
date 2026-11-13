@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "edge-log-shipper"
 version = "1.0.0"
-description = "Zero-dependency edge log streaming daemon with store-and-forward spooling, CWE-117 sanitization, and WireGuard mesh support."
+description = "Python project for shipping log messages and managing a local spool."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -25,8 +25,7 @@ keywords = [
     "audit",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Intended Audience :: System Administrators",
+      "Intended Audience :: System Administrators",
     "Intended Audience :: Information Technology",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
