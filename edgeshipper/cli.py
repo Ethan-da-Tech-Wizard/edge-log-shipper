@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: cli.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Command-line interface parser and dispatcher supporting one-shot syslog
+#          delivery, continuous file tailing, stdin ingestion, and spool queue management.
+# ==============================================================================
 """
 Command-Line Interface (CLI) for Edge Log Shipper.
 

@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: transport.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Resilient syslog transport client for TCP and UDP protocols featuring
+#          TCP_NODELAY optimization, SO_KEEPALIVE, and exponential backoff reconnection.
+# ==============================================================================
 """
 Resilient Syslog Transport Client for TCP and UDP with Exponential Backoff.
 
@@ -117,6 +124,7 @@ class SyslogTransport:
             except OSError:
                 pass
 
+    # Step 1: Establish socket connection with configured timeout and socket options
     def connect(self) -> bool:
         """
         Establish transport connection to upstream syslog collector.

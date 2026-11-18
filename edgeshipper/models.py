@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: models.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Data models, schema definitions, and syslog RFC protocol wire encoders
+#          implementing RFC 5424 structured logging, RFC 3164 legacy format, and octet-counting framing.
+# ==============================================================================
 """
 Data models, schema definitions, and syslog RFC protocol encoders for edge-log-shipper.
 
@@ -146,6 +153,7 @@ def parse_severity(val: Union[str, int]) -> int:
 
 
 @dataclass
+# Step 1: Canonical log message data model with automatic priority calculation
 class LogMessage:
     """
     Represents an atomic, structured log record ready for formatting and transmission.
@@ -198,6 +206,7 @@ class LogMessage:
         """
         return (self.facility * 8) + self.severity
 
+    # Step 2: Encode message according to RFC 5424 modern structured syslog specification
     def format_rfc5424(self) -> str:
         """
         Encode the message according to modern RFC 5424 syslog specification.
@@ -238,6 +247,7 @@ class LogMessage:
             return f"{header} {self.message}"
         return header
 
+    # Step 3: Encode message according to RFC 3164 legacy BSD syslog specification
     def format_rfc3164(self) -> str:
         """
         Encode the message according to legacy RFC 3164 (BSD syslog) specification.

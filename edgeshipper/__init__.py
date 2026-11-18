@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: __init__.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Package entrypoint for edgeshipper, exposing core syslog data models,
+#          sanitization engines, disk FIFO spool queues, and network transport clients.
+# ==============================================================================
 """
 edgeshipper: Zero-dependency edge log streaming daemon with store-and-forward spooling.
 
@@ -21,6 +28,7 @@ from edgeshipper.spooler import SpoolQueue
 from edgeshipper.tailer import FileTailer, StdinTailer
 from edgeshipper.transport import SyslogTransport
 
+# Step 1: Export public API symbols for edge-log-shipper
 __all__ = [
     "LogMessage",
     "ShipperConfig",

@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: spooler.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Atomic local store-and-forward FIFO spool queue with disk backpressure guards,
+#          providing crash-resilient message buffering during network disconnects.
+# ==============================================================================
 """
 Atomic Local Store-and-Forward FIFO Spool Queue with Disk Backpressure Guards.
 

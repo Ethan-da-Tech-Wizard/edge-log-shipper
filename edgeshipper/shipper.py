@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: shipper.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Core edge log shipper orchestration daemon coordinating the sanitizer,
+#          RFC protocol formatter, disk spool queue, and network socket transport.
+# ==============================================================================
 """
 Core Edge Log Shipper Orchestration Daemon.
 

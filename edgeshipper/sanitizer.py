@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: sanitizer.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Log sanitization and CWE-117 (Improper Output Handling for Logs) defense engine.
+#          Strips control characters, newlines, ANSI escape sequences, and Unicode bidi overrides.
+# ==============================================================================
 """
 Log Sanitizer and CWE-117 (Improper Output Handling for Logs) Defense Engine.
 

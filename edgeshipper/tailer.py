@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: tailer.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: POSIX inode-aware file tailer supporting log rotation detection (rename and
+#          copytruncate), partial line buffering, and standard input streaming.
+# ==============================================================================
 """
 POSIX Inode-Aware File Tailer with Log Rotation Detection and Stdin Streaming.
 

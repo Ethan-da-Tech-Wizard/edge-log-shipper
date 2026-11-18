@@ -1,3 +1,10 @@
+# ==============================================================================
+# Program: test_edgeshipper.py
+# Programmer: Ethan-da-Tech-Wizard
+# Last Modified: November 18, 2026
+# Purpose: Exhaustive unit and integration test suite for edge-log-shipper validating
+#          RFC 5424/3164 formatting, CWE-117 sanitization, disk spool queues, and tailers.
+# ==============================================================================
 """
 Exhaustive Unit and Integration Test Suite for edge-log-shipper.
 
@@ -46,6 +53,7 @@ from edgeshipper.tailer import FileTailer, StdinTailer
 from edgeshipper.transport import SyslogTransport
 
 
+# Step 1: Test syslog protocol encoders, PRI calculations, and framing formats
 class TestSyslogModels(unittest.TestCase):
     """Test suite for syslog models, parsers, and wire format serialization."""
 
@@ -174,6 +182,7 @@ class TestSyslogModels(unittest.TestCase):
             ShipperConfig(framing="header_len")
 
 
+# Step 2: Test CWE-117 sanitization, ANSI stripping, and length limits
 class TestLogSanitizer(unittest.TestCase):
     """Test suite for CWE-117 log injection and ANSI terminal scrubbing."""
 
@@ -227,6 +236,7 @@ class TestLogSanitizer(unittest.TestCase):
         self.assertEqual(bounded_sanitizer.sanitize(long_string), "0123456789")
 
 
+# Step 3: Test disk FIFO spool queue persistence, backpressure, and crash recovery
 class TestSpoolQueue(unittest.TestCase):
     """Test suite for crash-resilient local disk store-and-forward FIFO queue."""
 
@@ -433,6 +443,7 @@ class TestSyslogTransport(unittest.TestCase):
             self.assertLessEqual(delay, 10.0)
 
 
+# Step 4: Test file tailing, rotation detection, and line buffering
 class TestFileTailer(unittest.TestCase):
     """Test suite for POSIX file tailing, rotation, and truncation handling."""
 
