@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - cli.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Defines the edgeshipper command-line interface (send, tail, spool-status, flush, purge) and wires each subcommand to the shipper and spooler.
 """
 Command-Line Interface (CLI) for Edge Log Shipper.
 
@@ -19,6 +23,7 @@ CLI WORKFLOWS & OPERATIONAL CAPABILITIES:
 
 from __future__ import annotations
 
+# argparse reads the command-line arguments for us.
 import argparse
 import json
 import os
@@ -33,6 +38,7 @@ from edgeshipper.tailer import FileTailer, StdinTailer
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line argument parser with subcommands and flags."""
+    # Top-level parser; each subcommand below adds its own options.
     parser = argparse.ArgumentParser(
         prog="edgeshipper",
         description="Zero-dependency edge log streaming daemon with store-and-forward spooling.",
@@ -44,10 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Subparsers for commands
+    # The chosen subcommand name is stored in args.command and is required.
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Helper function to add common networking and spooling flags
     def add_common_flags(subp: argparse.ArgumentParser) -> None:
+        """Add the shared network and spool options (host, port, protocol, format, framing, spool dir, sanitize, app name, facility, severity) to a subcommand parser."""
         subp.add_argument(
             "--host",
             default="127.0.0.1",
@@ -105,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     # Subcommand: send
+    # Subcommand: send one message and exit.
     send_parser = subparsers.add_parser("send", help="Send a single log message")
     send_parser.add_argument(
         "-m", "--message",
@@ -114,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_flags(send_parser)
 
     # Subcommand: tail
+    # Subcommand: keep forwarding lines from a file or stdin.
     tail_parser = subparsers.add_parser("tail", help="Tail a log file or stream from stdin")
     tail_parser.add_argument(
         "-f", "--file",
@@ -138,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_flags(tail_parser)
 
     # Subcommand: spool-status
+    # Subcommand: show how full the disk queue is.
     status_parser = subparsers.add_parser("spool-status", help="Inspect local spool queue status")
     status_parser.add_argument(
         "--spool-dir",
@@ -151,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Subcommand: flush
+    # Subcommand: send everything waiting in the spool.
     flush_parser = subparsers.add_parser("flush", help="Drain pending spool buffer to upstream server")
     add_common_flags(flush_parser)
     flush_parser.add_argument(
@@ -161,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # Subcommand: purge
+    # Subcommand: delete everything waiting in the spool.
     purge_parser = subparsers.add_parser("purge", help="Clear all pending logs in local spool")
     purge_parser.add_argument(
         "--spool-dir",
@@ -173,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def create_config_from_args(args: argparse.Namespace) -> ShipperConfig:
     """Map parsed CLI namespace arguments into typed ShipperConfig dataclass."""
+    # Convert names like 'user' or 'info' into the numbers syslog uses.
     facility_code = parse_facility(args.facility)
     severity_code = parse_severity(args.severity)
 
@@ -183,6 +197,7 @@ def create_config_from_args(args: argparse.Namespace) -> ShipperConfig:
         syslog_format=args.syslog_format,
         framing=args.framing,
         spool_dir=args.spool_dir,
+        # The flag turns sanitizing OFF, so invert it for the config.
         sanitize=not getattr(args, "no_sanitize", False),
         app_name=args.app_name,
         facility=facility_code,
@@ -193,8 +208,10 @@ def create_config_from_args(args: argparse.Namespace) -> ShipperConfig:
 def cmd_send(args: argparse.Namespace) -> int:
     """Execute 'send' subcommand."""
     config = create_config_from_args(args)
+    # Build a shipper from the settings.
     shipper = EdgeShipper(config)
     try:
+        # Send the one message (it is spooled to disk if the network is down).
         success = shipper.ship_message(args.message)
         if success:
             spool_stat = shipper.spooler.status()
@@ -218,18 +235,21 @@ def cmd_tail(args: argparse.Namespace) -> int:
     try:
         if args.file:
             print(f"[edgeshipper] Tailing file: {args.file} -> {config.protocol.upper()}://{config.target_host}:{config.target_port}")
+            # Follow the file; --no-follow and --from-start flip the defaults.
             tailer = FileTailer(
                 filepath=args.file,
                 follow=not args.no_follow,
                 start_at_end=not args.from_start,
                 poll_interval=args.poll_interval,
             )
+            # Blocks, forwarding each new line until stopped.
             shipper.run_stream(tailer.tail())
         else:
             print(f"[edgeshipper] Streaming from stdin -> {config.protocol.upper()}://{config.target_host}:{config.target_port}")
             tailer = StdinTailer()
             shipper.run_stream(tailer.stream())
         return 0
+    # Ctrl+C is a normal way to stop tailing, so exit with success.
     except KeyboardInterrupt:
         print("\n[edgeshipper] Stopped by user signal.")
         return 0
@@ -239,6 +259,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 def cmd_spool_status(args: argparse.Namespace) -> int:
     """Execute 'spool-status' subcommand."""
+    # This command only touches the disk queue, no network needed.
     spooler = SpoolQueue(spool_dir=args.spool_dir)
     stat = spooler.status()
 
@@ -263,6 +284,7 @@ def cmd_flush(args: argparse.Namespace) -> int:
         print(f"[edgeshipper] Flushing spool buffer to {config.target_host}:{config.target_port}...")
         total_flushed = 0
         while True:
+            # Keep draining in batches until a batch sends nothing (empty or network down).
             flushed = shipper.flush_spool(batch_size=args.batch_size)
             if flushed == 0:
                 break
@@ -285,9 +307,11 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Entry point for CLI execution."""
+    # Build the parser, then read the real command line (or the list passed in by tests).
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # Dispatch to the function for the chosen subcommand.
     if args.command == "send":
         return cmd_send(args)
     elif args.command == "tail":

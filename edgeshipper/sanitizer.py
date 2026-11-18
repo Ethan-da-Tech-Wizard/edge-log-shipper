@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - sanitizer.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Cleans untrusted log text (ANSI escapes, bidi overrides, newlines, control characters, over-long input) so each log record stays one safe line.
 """
 Log Sanitizer and CWE-117 (Improper Output Handling for Logs) Defense Engine.
 
@@ -41,6 +45,7 @@ single-line, non-executable, human- and machine-readable log payload.
 
 from __future__ import annotations
 
+# re provides regular expressions used to find escape sequences.
 import re
 from typing import Pattern
 
@@ -103,6 +108,7 @@ class LogSanitizer:
             preserve_tabs: If True, preserves horizontal tabs ('\\t'); if False, escapes them.
             max_message_length: Bounds maximum payload size to prevent memory exhaustion / DoS.
         """
+        # Remember each option so sanitize() can follow it later.
         self.strip_ansi = strip_ansi
         self.escape_newlines = escape_newlines
         self.strip_bidi = strip_bidi
@@ -126,18 +132,22 @@ class LogSanitizer:
         Returns:
             Sanitized, single-line safe text string.
         """
+        # Nothing to clean: empty or None input becomes an empty string.
         if not raw_input:
             return ""
 
         # Step 1: Enforce maximum message length constraint
+        # Cut the text to the maximum length so huge inputs cannot use up memory.
         text = str(raw_input)[: self.max_message_length]
 
         # Step 2: Strip ANSI escape sequences (CSI, OSC, etc.)
         if self.strip_ansi:
+            # Replace every matched escape sequence with nothing (delete it).
             text = ANSI_ESCAPE_RE.sub("", text)
 
         # Step 3: Strip Unicode Bidirectional (Bidi) spoofing characters
         if self.strip_bidi:
+            # Delete direction-override characters that could disguise text.
             text = BIDI_OVERRIDES_RE.sub("", text)
 
         # Step 4: Handle line-splitting characters (\r and \n)
@@ -150,8 +160,10 @@ class LogSanitizer:
 
         # Step 5: Sanitize low-order ASCII control characters (0x00 - 0x1F) and DEL (0x7F)
         # Tab (\t) can optionally be preserved for structured TSV or tabular logs.
+        # Walk the text one character at a time and build the cleaned result.
         cleaned_chars = []
         for ch in text:
+            # ord() gives the numeric code of the character so we can test its range.
             code = ord(ch)
             if code == 9:  # Horizontal Tab (\t)
                 if self.preserve_tabs:
@@ -164,10 +176,12 @@ class LogSanitizer:
             else:
                 cleaned_chars.append(ch)
 
+        # Glue the cleaned characters back into one string.
         return "".join(cleaned_chars)
 
 
 # Default module-level singleton instance for zero-allocation reuse
+# Built once at import time and reused so we do not create a new object per message.
 _DEFAULT_SANITIZER = LogSanitizer()
 
 
@@ -189,9 +203,11 @@ def sanitize_log_message(
     Returns:
         Sanitized, line-safe log string.
     """
+    # Default settings: reuse the shared sanitizer.
     if strip_ansi and escape_newlines and preserve_tabs:
         return _DEFAULT_SANITIZER.sanitize(message)
     
+    # Non-default settings: make a one-off sanitizer with the requested options.
     custom = LogSanitizer(
         strip_ansi=strip_ansi,
         escape_newlines=escape_newlines,

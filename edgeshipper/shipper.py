@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - shipper.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Defines EdgeShipper, which sanitizes, formats and sends log lines over the network, falling back to the disk spool and replaying it in order.
 """
 Core Edge Log Shipper Orchestration Daemon.
 
@@ -35,6 +39,7 @@ from edgeshipper.spooler import SpoolQueue
 from edgeshipper.tailer import FileTailer, StdinTailer
 from edgeshipper.transport import SyslogTransport
 
+# Module-level logger named after the package.
 logger = logging.getLogger("edgeshipper")
 
 
@@ -50,14 +55,19 @@ class EdgeShipper:
         Parameters:
             config: Operational configuration settings. Uses defaults if omitted.
         """
+        # Use the given settings, or the defaults if none were provided.
         self.config = config or ShipperConfig()
+        # Only create a sanitizer when sanitizing is switched on.
         self.sanitizer = LogSanitizer() if self.config.sanitize else None
+        # The disk queue that holds messages while the network is unavailable.
         self.spooler = SpoolQueue(
             spool_dir=self.config.spool_dir,
             max_spool_bytes=self.config.max_spool_bytes,
             max_spool_entries=self.config.max_spool_entries,
         )
+        # The network client that actually sends bytes to the collector.
         self.transport = SyslogTransport(self.config)
+        # Flag checked by run_stream so the loop can be stopped.
         self._is_running: bool = False
 
     def ship_message(
@@ -89,6 +99,7 @@ class EdgeShipper:
             msg_text = self.sanitizer.sanitize(raw_message)
 
         # Step 2: Construct LogMessage record
+        # Use the caller's override if given, otherwise fall back to the configured default (same pattern for each field).
         log_entry = LogMessage(
             message=msg_text,
             facility=facility if facility is not None else self.config.facility,
@@ -100,19 +111,23 @@ class EdgeShipper:
         # Step 3: Check FIFO ordering constraint
         # If older records are already queued in the spool buffer, this new record MUST
         # be appended to the spool queue first to prevent timeline inversion.
+        # Ask the spool how many messages are waiting.
         spool_status = self.spooler.status()
         if spool_status["pending_count"] > 0:
             self.spooler.enqueue(log_entry)
             # Attempt opportunistic drain of backlog
+            # Try to send some of the backlog right away, oldest first.
             self.flush_spool(batch_size=50)
             return True
 
         # Step 4: Spool is empty: Attempt direct socket transmission
+        # Turn the record into the exact bytes that go on the network.
         wire_bytes = log_entry.to_wire_bytes(
             format_type=self.config.syslog_format,
             framing=self.config.framing,
         )
 
+        # True means the collector accepted the bytes.
         sent = self.transport.send_bytes(wire_bytes)
         if sent:
             return True
@@ -131,11 +146,13 @@ class EdgeShipper:
         Returns:
             Count of successfully transmitted and acknowledged records.
         """
+        # Look at the oldest entries without removing them yet (removal happens only after a successful send).
         entries = self.spooler.peek(limit=batch_size)
         if not entries:
             return 0
 
         # Attempt to ensure transport connection is active
+        # Make sure there is a live connection before sending the batch.
         if not self.transport.is_connected:
             if not self.transport.connect():
                 return 0
@@ -151,12 +168,14 @@ class EdgeShipper:
                 successfully_sent += 1
             else:
                 # Network failed mid-batch: increment failure attempts and halt flush
+                # Everything not yet sent in this batch counts as one more failed attempt.
                 failed_ids = [e.id for e in entries[successfully_sent:]]
                 self.spooler.increment_attempts(failed_ids)
                 break
 
         # Atomically acknowledge and remove all delivered entries from disk
         if successfully_sent > 0:
+            # Remove exactly the entries that were delivered, keeping order.
             self.spooler.acknowledge(successfully_sent)
 
         return successfully_sent
@@ -168,10 +187,12 @@ class EdgeShipper:
         Parameters:
             line_iterator: Generator yielding individual log lines.
         """
+        # Mark the loop as active.
         self._is_running = True
         last_flush_check = time.time()
 
         try:
+            # Each loop pass handles one log line from the tailer.
             for line in line_iterator:
                 if not self._is_running:
                     break
@@ -180,6 +201,7 @@ class EdgeShipper:
 
                 # Periodic background spool flush check every 2 seconds
                 now = time.time()
+                # Every 2 seconds, try to drain any backlog even if new lines are arriving.
                 if now - last_flush_check > 2.0:
                     last_flush_check = now
                     spool_stat = self.spooler.status()
@@ -187,6 +209,7 @@ class EdgeShipper:
                         self.flush_spool(batch_size=100)
 
         finally:
+            # Always clean up, even if the stream raised an error.
             self.close()
 
     def close(self) -> None:
@@ -194,7 +217,9 @@ class EdgeShipper:
         self._is_running = False
         # Attempt a final flush of any remaining pending records
         try:
+            # Last attempt to send whatever is still queued.
             self.flush_spool(batch_size=200)
         except Exception:
             pass
+        # Release the socket.
         self.transport.close()

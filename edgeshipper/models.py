@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - models.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Holds the data classes (LogMessage, SpoolEntry, ShipperConfig) and the syslog facility/severity tables and RFC 5424 / RFC 3164 formatting used on the wire.
 """
 Data models, schema definitions, and syslog RFC protocol encoders for edge-log-shipper.
 
@@ -12,11 +16,13 @@ Zero external dependencies: Built strictly with Python 3 standard library module
 
 from __future__ import annotations
 
+# Standard-library imports only (no third-party packages).
 import datetime
 import json
 import os
 import socket
 import time
+# dataclass auto-generates __init__ for the simple record classes below.
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional, Union
 
@@ -53,6 +59,7 @@ FACILITY_MAP: Dict[str, int] = {
 }
 
 # Reverse facility mapping for human-readable introspection
+# Flip name->number into number->name with a dictionary comprehension.
 FACILITY_REVERSE_MAP: Dict[int, str] = {v: k for k, v in FACILITY_MAP.items()}
 
 # ==============================================================================
@@ -102,16 +109,20 @@ def parse_facility(val: Union[str, int]) -> int:
     Raises:
         ValueError: If facility name or number is unrecognized/out-of-bounds.
     """
+    # Case 1: the caller already gave a number, so only check its range.
     if isinstance(val, int):
         if 0 <= val <= 23:
             return val
         raise ValueError(f"Syslog facility code {val} out of bounds (must be 0-23)")
+    # Normalize text input: drop spaces and ignore upper/lower case.
     norm = str(val).strip().lower()
+    # Case 2: a numeric string such as '16'; convert and range-check it.
     if norm.isdigit():
         code = int(norm)
         if 0 <= code <= 23:
             return code
         raise ValueError(f"Syslog facility code {code} out of bounds (must be 0-23)")
+    # Case 3: a facility name such as 'local0'; look it up in the table.
     if norm in FACILITY_MAP:
         return FACILITY_MAP[norm]
     raise ValueError(f"Unknown syslog facility name '{val}'. Valid: {list(FACILITY_MAP.keys())}")
@@ -140,6 +151,7 @@ def parse_severity(val: Union[str, int]) -> int:
         if 0 <= code <= 7:
             return code
         raise ValueError(f"Syslog severity code {code} out of bounds (must be 0-7)")
+    # Case 3: a severity name such as 'err'; look it up in the table.
     if norm in SEVERITY_MAP:
         return SEVERITY_MAP[norm]
     raise ValueError(f"Unknown syslog severity name '{val}'. Valid: {list(SEVERITY_MAP.keys())}")
@@ -176,6 +188,7 @@ class LogMessage:
         Fill in default dynamic environment values if left unpopulated.
         Ensures timestamps and host identities are deterministically initialized.
         """
+        # Fill in any value the caller left as None (time, hostname, process id).
         if self.timestamp is None:
             self.timestamp = time.time()
         if self.hostname is None:
@@ -196,6 +209,7 @@ class LogMessage:
             Facility 1 (user) * 8 + Severity 6 (info) = 8 + 6 = 14.
             Enclosed in wire format as: <14>
         """
+        # Facility goes in the upper bits (x8) and severity in the lower 3 bits.
         return (self.facility * 8) + self.severity
 
     def format_rfc5424(self) -> str:
@@ -217,6 +231,7 @@ class LogMessage:
             - STRUCTURED-DATA: Bracketed structured fields or NILVALUE '-'.
             - MSG: The payload message content.
         """
+        # Compute the <PRI> number that starts every syslog line.
         pri = self.calculate_pri()
         version = "1"
 
@@ -234,6 +249,7 @@ class LogMessage:
 
         # Assemble RFC 5424 header and payload
         header = f"<{pri}>{version} {iso_ts} {host} {app} {pid} {mid} {sd}"
+        # Only append the message text if there is one; otherwise send just the header.
         if self.message:
             return f"{header} {self.message}"
         return header
@@ -284,8 +300,10 @@ class LogMessage:
         else:
             text = self.format_rfc5424()
 
+        # Convert text to bytes; bad characters become replacement marks instead of crashing.
         payload_bytes = text.encode("utf-8", errors="replace")
 
+        # Octet framing: tell the receiver exactly how many bytes follow.
         if framing.lower() == "octet":
             # RFC 6587 Section 3.4.1: Octet Counting
             # Structure: MSG-LEN SP MSG
@@ -300,6 +318,7 @@ class LogMessage:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert log record to dictionary for local JSON spooling serialization."""
+        # asdict turns the dataclass into a plain dictionary that json can save.
         return asdict(self)
 
     @classmethod
@@ -331,11 +350,13 @@ class SpoolEntry:
     """
     id: str
     created_at: float
+    # The wrapped log record (stored as a nested dictionary in JSON).
     log_message: LogMessage
     attempts: int = 0
 
     def to_json(self) -> str:
         """Serialize spool record to compact JSON string."""
+        # Build one JSON object per queue entry (one line in the journal file).
         return json.dumps({
             "id": self.id,
             "created_at": self.created_at,
@@ -399,6 +420,7 @@ class ShipperConfig:
 
     def __post_init__(self) -> None:
         """Validate protocol and framing options upon instantiation."""
+        # Normalize each option to lower case, then reject unsupported values with a clear error.
         self.protocol = self.protocol.lower()
         if self.protocol not in ("tcp", "udp"):
             raise ValueError(f"Unsupported transport protocol '{self.protocol}'. Must be 'tcp' or 'udp'.")

@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - transport.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Defines SyslogTransport, a TCP/UDP socket client that connects, sends bytes, sets keepalive options and computes jittered reconnect backoff.
 """
 Resilient Syslog Transport Client for TCP and UDP with Exponential Backoff.
 
@@ -48,6 +52,7 @@ LOW-LEVEL NETWORK & SOCKET PROGRAMMING CONCEPTS:
 
 from __future__ import annotations
 
+# random is used to add jitter to the reconnect delay.
 import random
 import socket
 import time
@@ -69,6 +74,7 @@ class SyslogTransport:
             config: ShipperConfig instance specifying target host, port, protocol, and timeouts.
         """
         self.config = config
+        # State: the socket (None when closed), a connected flag, a failure counter and the time of the last failure.
         self._sock: Optional[socket.socket] = None
         self._is_connected: bool = False
         self._reconnect_attempts: int = 0
@@ -77,6 +83,7 @@ class SyslogTransport:
     @property
     def is_connected(self) -> bool:
         """Return current logical connection status."""
+        # Connected only if the flag is set and a socket exists.
         return self._is_connected and (self._sock is not None)
 
     def _configure_tcp_socket_options(self, sock: socket.socket) -> None:
@@ -127,14 +134,17 @@ class SyslogTransport:
         Returns:
             True if connection established successfully, False on failure.
         """
+        # Drop any old connection before opening a new one.
         self.close()
 
+        # Sockets take the address as a (host, port) pair.
         target = (self.config.target_host, self.config.target_port)
 
         sock: Optional[socket.socket] = None
         try:
             if self.config.protocol == "tcp":
                 # Create TCP stream socket
+                # SOCK_STREAM means TCP (IPv4).
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(self.config.connect_timeout)
 
@@ -154,6 +164,7 @@ class SyslogTransport:
 
             elif self.config.protocol == "udp":
                 # Create UDP datagram socket
+                # SOCK_DGRAM means UDP (IPv4).
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.settimeout(self.config.send_timeout)
                 # For UDP, socket.connect() associates the socket with the remote address,
@@ -165,6 +176,7 @@ class SyslogTransport:
                 self._reconnect_attempts = 0
                 return True
 
+        # Any network problem: record the failure so backoff can grow, then clean up.
         except (socket.error, OSError) as exc:
             self._is_connected = False
             self._last_connect_failure = time.time()
@@ -193,9 +205,11 @@ class SyslogTransport:
         base = self.config.reconnect_backoff_initial
         mult = self.config.reconnect_backoff_multiplier
         cap = self.config.reconnect_backoff_max
+        # Cap the exponent so the delay maths stays small.
         attempt = min(self._reconnect_attempts, 10)  # Bound power to prevent float overflow
 
         ceiling = min(cap, base * (mult ** attempt))
+        # Pick a random delay up to the ceiling (jitter) so many clients do not retry together.
         return random.uniform(0.1, max(0.2, ceiling))
 
     def send_bytes(self, payload: bytes) -> bool:
@@ -211,6 +225,7 @@ class SyslogTransport:
         Returns:
             True if transmission succeeded, False if socket error occurred.
         """
+        # Connect lazily: open a connection on first send or after a failure.
         if not self._is_connected or self._sock is None:
             if not self.connect():
                 return False
@@ -219,6 +234,7 @@ class SyslogTransport:
             if self._sock is None:
                 return False
             # sendall() continues writing until all bytes in payload are sent or an error occurs
+            # sendall keeps writing until every byte is sent.
             self._sock.sendall(payload)
             return True
         except (socket.error, OSError):
@@ -236,6 +252,7 @@ class SyslogTransport:
         Returns:
             Tuple of (sent_count, list_of_failed_payloads).
         """
+        # Count how many payloads were delivered, in order.
         sent_count = 0
         for i, payload in enumerate(payloads):
             success = self.send_bytes(payload)
@@ -251,6 +268,7 @@ class SyslogTransport:
         self._is_connected = False
         if self._sock is not None:
             try:
+                # Politely end both directions of the connection, then close it.
                 self._sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass

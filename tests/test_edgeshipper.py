@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - test_edgeshipper.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Unit and end-to-end tests (unittest) covering syslog formatting, sanitizing, the spool queue, transport, file tailing, the shipper and the CLI.
 """
 Exhaustive Unit and Integration Test Suite for edge-log-shipper.
 
@@ -50,6 +54,7 @@ class TestSyslogModels(unittest.TestCase):
     """Test suite for syslog models, parsers, and wire format serialization."""
 
     def test_facility_parsing(self) -> None:
+        """Facility names and numbers map to the right codes and bad values raise ValueError."""
         self.assertEqual(parse_facility("kern"), 0)
         self.assertEqual(parse_facility("user"), 1)
         self.assertEqual(parse_facility("auth"), 4)
@@ -65,6 +70,7 @@ class TestSyslogModels(unittest.TestCase):
             parse_facility(-1)
 
     def test_severity_parsing(self) -> None:
+        """Severity names and numbers map to the right codes and bad values raise ValueError."""
         self.assertEqual(parse_severity("emerg"), 0)
         self.assertEqual(parse_severity("alert"), 1)
         self.assertEqual(parse_severity("crit"), 2)
@@ -83,6 +89,7 @@ class TestSyslogModels(unittest.TestCase):
     def test_pri_calculation(self) -> None:
         # PRI = (facility * 8) + severity
         # user (1) * 8 + info (6) = 14
+        """PRI equals facility * 8 + severity for sample values."""
         msg = LogMessage(message="test", facility=1, severity=6)
         self.assertEqual(msg.calculate_pri(), 14)
 
@@ -95,6 +102,7 @@ class TestSyslogModels(unittest.TestCase):
         self.assertEqual(msg3.calculate_pri(), 0)
 
     def test_rfc5424_formatting(self) -> None:
+        """A message is formatted as a modern RFC 5424 syslog line."""
         ts = 1700000000.123456
         msg = LogMessage(
             message="System initialized successfully",
@@ -115,6 +123,7 @@ class TestSyslogModels(unittest.TestCase):
         self.assertTrue(wire_str.endswith("System initialized successfully"))
 
     def test_rfc3164_formatting(self) -> None:
+        """A message is formatted as a legacy RFC 3164 (BSD) syslog line."""
         ts = 1700000000.0  # Wed Nov 14 2023
         msg = LogMessage(
             message="Kernel link up",
@@ -131,6 +140,7 @@ class TestSyslogModels(unittest.TestCase):
         self.assertIn("firewall01 network[42]: Kernel link up", formatted)
 
     def test_framing_encodings(self) -> None:
+        """Octet-count and newline framing wrap the payload correctly."""
         msg = LogMessage(message="Ping", facility=1, severity=6)
         
         # Octet counting framing: '<length> <payload>'
@@ -145,6 +155,7 @@ class TestSyslogModels(unittest.TestCase):
         self.assertTrue(nl_bytes.endswith(b"\n"))
 
     def test_logmessage_and_spoolentry_serialization(self) -> None:
+        """LogMessage and SpoolEntry survive a round trip to dictionary/JSON and back."""
         msg = LogMessage(message="Disk alert", facility=16, severity=3)
         entry = SpoolEntry(id="entry123", created_at=time.time(), log_message=msg, attempts=1)
 
@@ -158,6 +169,7 @@ class TestSyslogModels(unittest.TestCase):
 
     def test_config_validation(self) -> None:
         # Valid config
+        """ShipperConfig accepts valid options and rejects unsupported ones."""
         cfg = ShipperConfig(protocol="tcp", syslog_format="rfc5424", framing="octet")
         self.assertEqual(cfg.protocol, "tcp")
 
@@ -178,10 +190,12 @@ class TestLogSanitizer(unittest.TestCase):
     """Test suite for CWE-117 log injection and ANSI terminal scrubbing."""
 
     def setUp(self) -> None:
+        """Create a default LogSanitizer for each test."""
         self.sanitizer = LogSanitizer()
 
     def test_ansi_escape_code_scrubbing(self) -> None:
         # Foreground red, clear line, reset codes
+        """ANSI escape sequences are removed from text."""
         evil_ansi = "Normal text \x1b[31;1mRED ALERT\x1b[0m \x1b[2Jcleared"
         cleaned = self.sanitizer.sanitize(evil_ansi)
         self.assertEqual(cleaned, "Normal text RED ALERT cleared")
@@ -193,6 +207,7 @@ class TestLogSanitizer(unittest.TestCase):
 
     def test_cwe_117_newline_injection_defense(self) -> None:
         # Line splitting injection attempt
+        """Newlines inside a message are escaped so one input cannot become two log lines."""
         injection = "admin\n2026-11-08T00:00:00Z auth.notice: Fake admin login"
         cleaned = self.sanitizer.sanitize(injection)
         # Embedded newline must be escaped to literal \n
@@ -208,12 +223,14 @@ class TestLogSanitizer(unittest.TestCase):
 
     def test_bidi_unicode_override_scrubbing(self) -> None:
         # Right-to-Left Override (U+202E) Trojan Source attempt
+        """Unicode direction-override characters are stripped."""
         bidi_text = "access_granted_\u202Etxt.exe"
         cleaned = self.sanitizer.sanitize(bidi_text)
         self.assertEqual(cleaned, "access_granted_txt.exe")
 
     def test_control_character_handling(self) -> None:
         # Null bytes, Bell, Backspace
+        """Control characters are turned into visible escapes."""
         polluted = "Safe\x00Text\x07With\x08Controls\tTabsArePreserved"
         cleaned = self.sanitizer.sanitize(polluted)
         self.assertIn("\\x00", cleaned)
@@ -222,6 +239,7 @@ class TestLogSanitizer(unittest.TestCase):
         self.assertIn("\t", cleaned)  # Tabs preserved by default
 
     def test_max_length_truncation(self) -> None:
+        """Over-long input is cut to the configured maximum length."""
         bounded_sanitizer = LogSanitizer(max_message_length=10)
         long_string = "0123456789abcdefghij"
         self.assertEqual(bounded_sanitizer.sanitize(long_string), "0123456789")
@@ -231,12 +249,15 @@ class TestSpoolQueue(unittest.TestCase):
     """Test suite for crash-resilient local disk store-and-forward FIFO queue."""
 
     def setUp(self) -> None:
+        """Create a fresh temporary directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="test_spool_")
 
     def tearDown(self) -> None:
+        """Delete the temporary directory after each test."""
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_enqueue_peek_and_acknowledge(self) -> None:
+        """Entries can be queued, peeked at in FIFO order, and removed by acknowledging."""
         queue = SpoolQueue(spool_dir=self.test_dir)
         msg1 = LogMessage(message="Message 1")
         msg2 = LogMessage(message="Message 2")
@@ -273,6 +294,7 @@ class TestSpoolQueue(unittest.TestCase):
         num_threads = 4
 
         def worker(thread_idx: int):
+            """Background thread body for this test."""
             for i in range(messages_per_thread):
                 queue.enqueue(LogMessage(message=f"Thread {thread_idx} - Msg {i}"))
 
@@ -290,6 +312,7 @@ class TestSpoolQueue(unittest.TestCase):
 
     def test_crash_recovery_persistence(self) -> None:
         # Phase 1: Write records to spool
+        """A new SpoolQueue on the same directory recovers entries that were not acknowledged."""
         queue1 = SpoolQueue(spool_dir=self.test_dir)
         queue1.enqueue(LogMessage(message="Survives reboot 1"))
         queue1.enqueue(LogMessage(message="Survives reboot 2"))
@@ -309,6 +332,7 @@ class TestSpoolQueue(unittest.TestCase):
 
     def test_capacity_backpressure_entry_limit(self) -> None:
         # Enforce max 3 entries
+        """When the entry limit is exceeded the oldest entries are dropped and counted."""
         queue = SpoolQueue(spool_dir=self.test_dir, max_spool_entries=3)
         for i in range(5):
             queue.enqueue(LogMessage(message=f"Log {i}"))
@@ -323,6 +347,7 @@ class TestSpoolQueue(unittest.TestCase):
         self.assertEqual(messages, ["Log 2", "Log 3", "Log 4"])
 
     def test_purge(self) -> None:
+        """purge() empties the queue and resets the counters."""
         queue = SpoolQueue(spool_dir=self.test_dir)
         queue.enqueue(LogMessage(message="To be purged"))
         self.assertEqual(queue.status()["pending_count"], 1)
@@ -338,6 +363,7 @@ class TestSyslogTransport(unittest.TestCase):
 
     def test_tcp_transport_delivery(self) -> None:
         # Spin up a temporary local TCP server
+        """Bytes sent through SyslogTransport arrive at a local TCP server."""
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_sock.bind(("127.0.0.1", 0))
         server_sock.listen(1)
@@ -346,6 +372,7 @@ class TestSyslogTransport(unittest.TestCase):
         received_data = []
 
         def accept_worker():
+            """Accepts one TCP connection and stores everything received."""
             try:
                 conn, _ = server_sock.accept()
                 while True:
@@ -385,6 +412,7 @@ class TestSyslogTransport(unittest.TestCase):
 
     def test_udp_transport_delivery(self) -> None:
         # Spin up a temporary local UDP receiver
+        """Bytes sent through SyslogTransport arrive at a local UDP socket."""
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_sock.bind(("127.0.0.1", 0))
         port = server_sock.getsockname()[1]
@@ -392,6 +420,7 @@ class TestSyslogTransport(unittest.TestCase):
         received_packets = []
 
         def udp_worker():
+            """Receives one UDP datagram and stores it."""
             try:
                 server_sock.settimeout(2.0)
                 data, _ = server_sock.recvfrom(2048)
@@ -421,6 +450,7 @@ class TestSyslogTransport(unittest.TestCase):
         self.assertEqual(received_packets[0], udp_payload)
 
     def test_exponential_backoff_bounds(self) -> None:
+        """calculate_backoff() stays within its expected bounds."""
         config = ShipperConfig(
             reconnect_backoff_initial=1.0,
             reconnect_backoff_max=10.0,
@@ -437,14 +467,17 @@ class TestFileTailer(unittest.TestCase):
     """Test suite for POSIX file tailing, rotation, and truncation handling."""
 
     def setUp(self) -> None:
+        """Create a fresh temporary directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="test_tailer_")
         self.log_file = Path(self.test_dir) / "app.log"
 
     def tearDown(self) -> None:
+        """Delete the temporary directory after each test."""
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_tail_static_file(self) -> None:
         # Write initial lines
+        """FileTailer reads the lines of an existing file when not following."""
         with open(self.log_file, "w", encoding="utf-8") as f:
             f.write("Line 1\nLine 2\nLine 3\n")
 
@@ -458,6 +491,7 @@ class TestFileTailer(unittest.TestCase):
 
     def test_copytruncate_rotation(self) -> None:
         # Simulate logrotate copytruncate: file truncated in-place
+        """FileTailer keeps reading after the file is truncated in place."""
         with open(self.log_file, "w", encoding="utf-8") as f:
             f.write("Initial line 1\nInitial line 2\n")
 
@@ -471,6 +505,7 @@ class TestFileTailer(unittest.TestCase):
         collected = []
 
         def worker():
+            """Background thread body for this test."""
             for line in tailer.tail():
                 collected.append(line)
                 if len(collected) >= 3:
@@ -492,6 +527,7 @@ class TestFileTailer(unittest.TestCase):
 
     def test_rename_and_recreate_rotation(self) -> None:
         # Simulate logrotate 'create' mode: mv app.log app.log.1 && touch app.log
+        """FileTailer switches to the new file after the old one is renamed and replaced."""
         with open(self.log_file, "w", encoding="utf-8") as f:
             f.write("Old Inode Line\n")
 
@@ -505,6 +541,7 @@ class TestFileTailer(unittest.TestCase):
         collected = []
 
         def worker():
+            """Background thread body for this test."""
             for line in tailer.tail():
                 collected.append(line)
                 if len(collected) >= 2:
@@ -527,6 +564,7 @@ class TestFileTailer(unittest.TestCase):
         self.assertIn("New Inode Line", collected)
 
     def test_stdin_tailer(self) -> None:
+        """StdinTailer yields the lines it reads from standard input."""
         import io
         import sys
         
@@ -541,6 +579,7 @@ class TestFileTailer(unittest.TestCase):
             sys.stdin = old_stdin
 
     def test_partial_line_buffering(self) -> None:
+        """A line written in pieces is only yielded once its newline arrives."""
         tailer = FileTailer(
             filepath=str(self.log_file),
             follow=True,
@@ -550,6 +589,7 @@ class TestFileTailer(unittest.TestCase):
         collected = []
 
         def worker():
+            """Background thread body for this test."""
             for line in tailer.tail():
                 collected.append(line)
                 if len(collected) >= 1:
@@ -580,13 +620,16 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
     """End-to-end integration tests for store-and-forward spool replay."""
 
     def setUp(self) -> None:
+        """Create a fresh temporary directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="test_e2e_")
 
     def tearDown(self) -> None:
+        """Delete the temporary directory after each test."""
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_store_and_forward_failover_and_replay(self) -> None:
         # Step 1: Upstream server is completely down (unbound port)
+        """Messages sent while the server is down are spooled, then delivered in order once it is up."""
         dead_port = 54321
         config = ShipperConfig(
             target_host="127.0.0.1",
@@ -615,6 +658,7 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
         received_wire = []
 
         def server_thread():
+            """Fake collector: accepts one connection and stores the bytes it receives."""
             server_sock.settimeout(4.0)
             try:
                 conn, _ = server_sock.accept()
@@ -654,12 +698,15 @@ class TestCliInterface(unittest.TestCase):
     """Test suite for CLI command dispatch and argument handling."""
 
     def setUp(self) -> None:
+        """Create a fresh temporary directory for each test."""
         self.test_dir = tempfile.mkdtemp(prefix="test_cli_")
 
     def tearDown(self) -> None:
+        """Delete the temporary directory after each test."""
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_cli_spool_status_json(self) -> None:
+        """The spool-status subcommand parses its --json and --spool-dir options."""
         parser = build_parser()
         args = parser.parse_args(["spool-status", "--spool-dir", self.test_dir, "--json"])
         self.assertEqual(args.command, "spool-status")
@@ -667,6 +714,7 @@ class TestCliInterface(unittest.TestCase):
 
     def test_cli_send_and_purge(self) -> None:
         # Send message with unreachable target (will spool)
+        """send spools a message when the target is unreachable, and purge empties the spool."""
         code = main([
             "send",
             "-m", "CLI Test Log",

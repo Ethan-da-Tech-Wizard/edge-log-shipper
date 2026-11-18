@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - spooler.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Implements SpoolQueue, a thread-safe on-disk FIFO queue (JSON lines journal plus metadata file) that holds logs while the network is down.
 """
 Atomic Local Store-and-Forward FIFO Spool Queue with Disk Backpressure Guards.
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+# threading.Lock keeps concurrent callers from corrupting the files.
 import threading
 import time
 import uuid
@@ -59,6 +64,7 @@ class SpoolQueue:
             sync_to_disk: If True, calls os.fsync on every append (maximum durability at
                           cost of write I/O operations). Defaults to False (uses OS page cache).
         """
+        # Turn the text path into an absolute Path object.
         self.spool_dir = Path(spool_dir).resolve()
         self.max_spool_bytes = max_spool_bytes
         self.max_spool_entries = max_spool_entries
@@ -71,7 +77,9 @@ class SpoolQueue:
         except OSError:
             pass  # Non-POSIX or restricted permission environments
 
+        # Journal file: one JSON record per line, one line per queued message.
         self.journal_path = self.spool_dir / "spool_journal.jsonl"
+        # Metadata file: counters that survive restarts.
         self.meta_path = self.spool_dir / "spool_meta.json"
 
         # Concurrency control: Mutex prevents concurrent threads from corrupting
@@ -85,6 +93,7 @@ class SpoolQueue:
         self._total_drained: int = 0
 
         # Load persisted backlog and metadata upon startup
+        # Reload anything left over from a previous run.
         self._initialize_from_disk()
 
     def _initialize_from_disk(self) -> None:
@@ -134,6 +143,7 @@ class SpoolQueue:
         Write metadata state atomically using write-and-rename pattern.
         This guarantees that an unexpected reboot never leaves a half-written JSON file.
         """
+        # Write to a temporary file first so a crash cannot leave a half-written file.
         tmp_meta = self.meta_path.with_suffix(".tmp")
         try:
             with open(tmp_meta, "w", encoding="utf-8") as f:
@@ -148,6 +158,7 @@ class SpoolQueue:
                 if self.sync_to_disk:
                     os.fsync(f.fileno())
             # Atomic filesystem rename replaces target atomically in POSIX
+            # Swap the finished temp file into place in one step.
             tmp_meta.replace(self.meta_path)
         except Exception:
             if tmp_meta.exists():
@@ -166,11 +177,13 @@ class SpoolQueue:
 
         # Check entry count ceiling
         while len(self._entries) > self.max_spool_entries:
+            # The oldest entry is at index 0 (first in, first out).
             self._entries.pop(0)  # Evict oldest entry
             self._dropped_count += 1
             need_compaction = True
 
         # Check total estimated byte quota
+        # Measure the files on disk before checking the byte limit.
         current_disk_bytes = self.get_disk_usage_unlocked()
         while current_disk_bytes > self.max_spool_bytes and self._entries:
             self._entries.pop(0)
@@ -179,6 +192,7 @@ class SpoolQueue:
             current_disk_bytes = self.get_disk_usage_unlocked()
 
         if need_compaction:
+            # Rewrite the journal so the file matches the in-memory list.
             self._rewrite_journal_unlocked()
             self._save_meta_unlocked()
 
@@ -214,6 +228,7 @@ class SpoolQueue:
         Returns:
             The created SpoolEntry containing assigned unique ID.
         """
+        # Random 16-character id so each entry can be told apart.
         entry_id = uuid.uuid4().hex[:16]
         entry = SpoolEntry(
             id=entry_id,
@@ -225,6 +240,7 @@ class SpoolQueue:
         with self._lock:
             # Append serialized record to active journal
             serialized_line = entry.to_json() + "\n"
+            # Append mode: add one line at the end without touching older lines.
             with open(self.journal_path, "a", encoding="utf-8") as f:
                 f.write(serialized_line)
                 f.flush()
@@ -254,6 +270,7 @@ class SpoolQueue:
             List of SpoolEntry records.
         """
         with self._lock:
+            # Return a copy so callers cannot change the queue by accident.
             return list(self._entries[:limit])
 
     def acknowledge(self, count: int) -> int:
@@ -273,6 +290,7 @@ class SpoolQueue:
         with self._lock:
             actual_count = min(count, len(self._entries))
             if actual_count > 0:
+                # Remove the oldest entries that were delivered.
                 del self._entries[:actual_count]
                 self._total_drained += actual_count
 
@@ -290,6 +308,7 @@ class SpoolQueue:
         Parameters:
             entry_ids: List of SpoolEntry IDs whose transmission failed.
         """
+        # A set makes the id lookup below fast.
         id_set = set(entry_ids)
         with self._lock:
             modified = False
@@ -325,6 +344,7 @@ class SpoolQueue:
         with self._lock:
             disk_bytes = self.get_disk_usage_unlocked()
             pending_count = len(self._entries)
+            # Age in seconds of the oldest waiting message (0 when empty).
             oldest_age = 0.0
             if self._entries:
                 oldest_age = max(0.0, time.time() - self._entries[0].created_at)

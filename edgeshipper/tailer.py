@@ -1,3 +1,7 @@
+# Program: edge-log-shipper - tailer.py
+# Programmer: Ethan-da-Tech-Wizard (written with Claude, an AI assistant)
+# Last Modified: 2026-11-18
+# Purpose: Provides FileTailer (follows a log file and survives rotation or truncation) and StdinTailer (reads log lines piped into standard input).
 """
 POSIX Inode-Aware File Tailer with Log Rotation Detection and Stdin Streaming.
 
@@ -80,11 +84,13 @@ class FileTailer:
                           (ignoring historical lines). If False, starts from byte 0.
             poll_interval: Sleep duration in seconds between idle filesystem checks.
         """
+        # Store the absolute path of the file to follow.
         self.filepath = Path(filepath).resolve()
         self.follow = follow
         self.start_at_end = start_at_end
         self.poll_interval = poll_interval
 
+        # State: the open file, its identity (inode and device) and any partial line read so far.
         self._file_handle = None
         self._current_inode: Optional[int] = None
         self._current_dev: Optional[int] = None
@@ -116,6 +122,7 @@ class FileTailer:
 
             # If instructed to start at end (tail -f behavior), seek to current EOF
             if self.start_at_end:
+                # Jump to the end so only new lines are forwarded.
                 f.seek(0, os.SEEK_END)
 
             return True
@@ -139,6 +146,7 @@ class FileTailer:
 
         try:
             # Check status of currently open file handle
+            # fstat describes the file we have open (even if it was renamed).
             current_fstat = os.fstat(self._file_handle.fileno())
             current_offset = self._file_handle.tell()
 
@@ -146,16 +154,19 @@ class FileTailer:
             # If current file size is smaller than our read offset, the file was truncated.
             if current_fstat.st_size < current_offset:
                 # Seek to beginning of the truncated file
+                # Go back to the start of the truncated file.
                 self._file_handle.seek(0, os.SEEK_SET)
                 return True
 
             # Case B: Inode divergence ('create' / rename rotation)
             # Check what inode is currently located at self.filepath on disk
             if self.filepath.exists():
+                # stat describes whatever file is at the path right now.
                 path_stat = self.filepath.stat()
                 if path_stat.st_ino != self._current_inode or path_stat.st_dev != self._current_dev:
                     # Inode has changed! A new file was placed at this path.
                     # Drain any remaining bytes from the old file handle first:
+                    # Read the last bytes left in the old file before leaving it.
                     trailing_data = self._file_handle.read()
                     if trailing_data:
                         self._buffer += trailing_data
@@ -188,6 +199,7 @@ class FileTailer:
             Complete, individual log lines (without trailing newline).
         """
         # Wait for file to appear if it does not yet exist
+        # Wait for the file to appear (unless we were asked to stop or not following).
         while not self._open_file() and not self._should_stop:
             if not self.follow:
                 return
@@ -196,6 +208,7 @@ class FileTailer:
         try:
             while not self._should_stop:
                 # Check for log rotation or truncation before each read pass
+                # Look for rotation or truncation before every read.
                 self._check_rotation()
 
                 if self._file_handle is None:
@@ -204,11 +217,13 @@ class FileTailer:
                         continue
 
                 # Read available chunk from file handle
+                # Read one line; it may be incomplete if the writer is mid-line.
                 chunk = self._file_handle.readline()
 
                 if chunk:
                     # If chunk ends with newline, we have a complete line
                     if chunk.endswith("\n") or chunk.endswith("\r"):
+                        # Join any saved partial text with this chunk and drop the newline.
                         complete_line = self._buffer + chunk.rstrip("\r\n")
                         self._buffer = ""
                         yield complete_line
@@ -225,6 +240,7 @@ class FileTailer:
                         break
 
                     # Idle sleep before next poll to prevent busy-waiting / 100% CPU burn
+                    # Rest briefly so polling does not use 100% CPU.
                     time.sleep(self.poll_interval)
 
         finally:
@@ -243,6 +259,7 @@ class StdinTailer:
     """
 
     def __init__(self) -> None:
+        """Create the stdin reader with its stop flag cleared."""
         self._should_stop = False
 
     def stop(self) -> None:
@@ -257,10 +274,12 @@ class StdinTailer:
             Complete lines stripped of trailing newlines.
         """
         try:
+            # Read lines as they arrive from the pipe; stops at end of input.
             for line in sys.stdin:
                 if self._should_stop:
                     break
                 clean_line = line.rstrip("\r\n")
+                # Skip blank lines.
                 if clean_line:
                     yield clean_line
         except (KeyboardInterrupt, BrokenPipeError):
