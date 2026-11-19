@@ -30,11 +30,9 @@ The Shipper enforces strict causal FIFO ordering:
 
 from __future__ import annotations
 
-# Stdlib only. Note: signal/sys/typing helpers are imported for the daemon
-# plumbing; the core pipeline below uses only time and our own modules.
+# Stdlib only. The core pipeline below uses logging, time and typing helpers
+# plus our own modules; signal handling lives in the CLI, not here.
 import logging
-import signal
-import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional, Union
 
