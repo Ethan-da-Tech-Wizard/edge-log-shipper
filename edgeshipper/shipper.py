@@ -31,7 +31,7 @@ The Shipper enforces strict causal FIFO ordering:
 from __future__ import annotations
 
 # Stdlib only. The core pipeline below uses logging, time and typing helpers
-# plus our own modules; signal handling lives in the CLI, not here.
+# plus our own modules; the CLI handles Ctrl-C (KeyboardInterrupt), not this module.
 import logging
 import time
 from typing import Any, Dict, Iterator, List, Optional, Union
