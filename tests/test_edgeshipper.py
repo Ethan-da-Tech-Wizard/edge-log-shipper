@@ -20,6 +20,8 @@ Validates:
 
 from __future__ import annotations
 
+# Only the standard library is needed: unittest as the runner, tempfile for
+# isolated spool directories, threading + socket for loopback mock servers.
 import json
 import os
 import shutil
@@ -32,6 +34,8 @@ import unittest
 from pathlib import Path
 
 # Ensure package directory is in sys.path for direct unittest discovery
+# Allow running this file directly (python tests/test_edgeshipper.py) without
+# installing the package: put the repo root on sys.path so 'edgeshipper' imports.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -57,6 +61,8 @@ from edgeshipper.transport import SyslogTransport
 class TestSyslogModels(unittest.TestCase):
     """Test suite for syslog models, parsers, and wire format serialization."""
 
+    # Covers symbolic names, ints, numeric strings, and rejection of unknown or
+    # out-of-range values (both 24 and negatives).
     def test_facility_parsing(self) -> None:
         self.assertEqual(parse_facility("kern"), 0)
         self.assertEqual(parse_facility("user"), 1)
@@ -72,6 +78,7 @@ class TestSyslogModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_facility(-1)
 
+    # Same contract as facilities, with the 0-7 range.
     def test_severity_parsing(self) -> None:
         self.assertEqual(parse_severity("emerg"), 0)
         self.assertEqual(parse_severity("alert"), 1)
@@ -88,6 +95,8 @@ class TestSyslogModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_severity(8)
 
+    # PRI arithmetic checked against hand-computed values, including both
+    # boundary cases (0 and a high local facility).
     def test_pri_calculation(self) -> None:
         # PRI = (facility * 8) + severity
         # user (1) * 8 + info (6) = 14
@@ -102,6 +111,9 @@ class TestSyslogModels(unittest.TestCase):
         msg3 = LogMessage(message="test", facility=0, severity=0)
         self.assertEqual(msg3.calculate_pri(), 0)
 
+    # Asserts structure (PRI+version prefix, fields present, message last)
+    # rather than the full string, because the timestamp is rendered in UTC and
+    # the hostname/PID defaults are environment-dependent.
     def test_rfc5424_formatting(self) -> None:
         ts = 1700000000.123456
         msg = LogMessage(
@@ -122,6 +134,8 @@ class TestSyslogModels(unittest.TestCase):
         self.assertIn("INIT01", wire_str)
         self.assertTrue(wire_str.endswith("System initialized successfully"))
 
+    # RFC 3164 timestamps use local time, so the test checks only the PRI and
+    # the 'host tag[pid]: message' tail, which are timezone independent.
     def test_rfc3164_formatting(self) -> None:
         ts = 1700000000.0  # Wed Nov 14 2023
         msg = LogMessage(
@@ -138,6 +152,8 @@ class TestSyslogModels(unittest.TestCase):
         self.assertTrue(formatted.startswith("<5>"))
         self.assertIn("firewall01 network[42]: Kernel link up", formatted)
 
+    # Octet counting: the decimal prefix must equal the payload length in bytes.
+    # Newline framing: the frame must end with a line feed.
     def test_framing_encodings(self) -> None:
         msg = LogMessage(message="Ping", facility=1, severity=6)
         
@@ -152,6 +168,8 @@ class TestSyslogModels(unittest.TestCase):
         nl_bytes = msg.to_wire_bytes(format_type="rfc5424", framing="newline")
         self.assertTrue(nl_bytes.endswith(b"\n"))
 
+    # Round-trip through JSON, the on-disk spool format, must preserve every
+    # field the replay path depends on.
     def test_logmessage_and_spoolentry_serialization(self) -> None:
         msg = LogMessage(message="Disk alert", facility=16, severity=3)
         entry = SpoolEntry(id="entry123", created_at=time.time(), log_message=msg, attempts=1)
@@ -164,6 +182,7 @@ class TestSyslogModels(unittest.TestCase):
         self.assertEqual(deserialized.log_message.facility, 16)
         self.assertEqual(deserialized.log_message.severity, 3)
 
+    # Bad protocol, format and framing values must fail fast at construction.
     def test_config_validation(self) -> None:
         # Valid config
         cfg = ShipperConfig(protocol="tcp", syslog_format="rfc5424", framing="octet")
@@ -189,6 +208,8 @@ class TestLogSanitizer(unittest.TestCase):
     def setUp(self) -> None:
         self.sanitizer = LogSanitizer()
 
+    # Covers CSI sequences (colour, clear screen) and an OSC window-title
+    # sequence terminated by BEL; all must vanish without leaving residue.
     def test_ansi_escape_code_scrubbing(self) -> None:
         # Foreground red, clear line, reset codes
         evil_ansi = "Normal text \x1b[31;1mRED ALERT\x1b[0m \x1b[2Jcleared"
@@ -200,6 +221,8 @@ class TestLogSanitizer(unittest.TestCase):
         cleaned_osc = self.sanitizer.sanitize(evil_osc)
         self.assertEqual(cleaned_osc, "User logged in")
 
+    # The core CWE-117 property: no raw CR or LF may survive, so an attacker
+    # cannot forge a second log record. Visible '\n' tokens remain for forensics.
     def test_cwe_117_newline_injection_defense(self) -> None:
         # Line splitting injection attempt
         injection = "admin\n2026-11-08T00:00:00Z auth.notice: Fake admin login"
@@ -215,12 +238,16 @@ class TestLogSanitizer(unittest.TestCase):
         self.assertNotIn("\n", cleaned_crlf)
         self.assertIn("malicious\\nINJECTED RECORD", cleaned_crlf)
 
+    # Trojan Source style: the right-to-left override must be removed so the
+    # visible text matches the underlying bytes.
     def test_bidi_unicode_override_scrubbing(self) -> None:
         # Right-to-Left Override (U+202E) Trojan Source attempt
         bidi_text = "access_granted_\u202Etxt.exe"
         cleaned = self.sanitizer.sanitize(bidi_text)
         self.assertEqual(cleaned, "access_granted_txt.exe")
 
+    # Control bytes become visible hex escapes; tabs are the one exception that
+    # is preserved by default.
     def test_control_character_handling(self) -> None:
         # Null bytes, Bell, Backspace
         polluted = "Safe\x00Text\x07With\x08Controls\tTabsArePreserved"
@@ -230,6 +257,7 @@ class TestLogSanitizer(unittest.TestCase):
         self.assertIn("\\x08", cleaned)
         self.assertIn("\t", cleaned)  # Tabs preserved by default
 
+    # Output is cut to max_message_length characters.
     def test_max_length_truncation(self) -> None:
         bounded_sanitizer = LogSanitizer(max_message_length=10)
         long_string = "0123456789abcdefghij"
@@ -240,12 +268,15 @@ class TestLogSanitizer(unittest.TestCase):
 class TestSpoolQueue(unittest.TestCase):
     """Test suite for crash-resilient local disk store-and-forward FIFO queue."""
 
+    # A fresh sanitizer with default settings for every test.
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_spool_")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    # Core FIFO contract: peek does not remove, acknowledge removes from the
+    # head, and the telemetry counters track both.
     def test_enqueue_peek_and_acknowledge(self) -> None:
         queue = SpoolQueue(spool_dir=self.test_dir)
         msg1 = LogMessage(message="Message 1")
@@ -275,6 +306,8 @@ class TestSpoolQueue(unittest.TestCase):
         self.assertEqual(status["total_enqueued"], 2)
         self.assertEqual(status["total_drained"], 1)
 
+    # Several threads enqueue at once; with the mutex nothing may be lost and
+    # the counters must add up exactly.
     def test_concurrent_multithreaded_enqueue(self) -> None:
         """Verify thread-safety when multiple worker threads enqueue concurrently."""
         queue = SpoolQueue(spool_dir=self.test_dir, max_spool_entries=1000)
@@ -298,6 +331,8 @@ class TestSpoolQueue(unittest.TestCase):
         self.assertEqual(stat["total_enqueued"], num_threads * messages_per_thread)
         self.assertEqual(stat["pending_count"], num_threads * messages_per_thread)
 
+    # Simulates a restart by discarding the first queue object and opening a
+    # new one on the same directory; backlog and lifetime counters must survive.
     def test_crash_recovery_persistence(self) -> None:
         # Phase 1: Write records to spool
         queue1 = SpoolQueue(spool_dir=self.test_dir)
@@ -317,6 +352,7 @@ class TestSpoolQueue(unittest.TestCase):
         self.assertEqual(len(peeked), 1)
         self.assertEqual(peeked[0].log_message.message, "Survives reboot 2")
 
+    # Over the entry cap, the OLDEST records are evicted and counted as dropped.
     def test_capacity_backpressure_entry_limit(self) -> None:
         # Enforce max 3 entries
         queue = SpoolQueue(spool_dir=self.test_dir, max_spool_entries=3)
@@ -332,6 +368,7 @@ class TestSpoolQueue(unittest.TestCase):
         messages = [e.log_message.message for e in entries]
         self.assertEqual(messages, ["Log 2", "Log 3", "Log 4"])
 
+    # After purge both the queue and the on-disk files are empty (0 bytes).
     def test_purge(self) -> None:
         queue = SpoolQueue(spool_dir=self.test_dir)
         queue.enqueue(LogMessage(message="To be purged"))
@@ -346,6 +383,9 @@ class TestSpoolQueue(unittest.TestCase):
 class TestSyslogTransport(unittest.TestCase):
     """Test suite for TCP and UDP network transport with mock socket listeners."""
 
+    # Loopback TCP server on an ephemeral port (bind to port 0 lets the OS pick
+    # a free one, avoiding collisions). The server collects every received chunk
+    # because TCP may split the payload arbitrarily.
     def test_tcp_transport_delivery(self) -> None:
         # Spin up a temporary local TCP server
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -393,6 +433,7 @@ class TestSyslogTransport(unittest.TestCase):
 
         self.assertEqual(b"".join(received_data), test_payload)
 
+    # Loopback UDP receiver; a datagram must arrive as exactly one packet.
     def test_udp_transport_delivery(self) -> None:
         # Spin up a temporary local UDP receiver
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -430,6 +471,8 @@ class TestSyslogTransport(unittest.TestCase):
         self.assertEqual(len(received_packets), 1)
         self.assertEqual(received_packets[0], udp_payload)
 
+    # Jittered delays are random, so only the bounds are asserted: the floor
+    # (0.1s) and the configured cap.
     def test_exponential_backoff_bounds(self) -> None:
         config = ShipperConfig(
             reconnect_backoff_initial=1.0,
@@ -454,6 +497,7 @@ class TestFileTailer(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    # One-shot mode (follow=False) reads an existing file to EOF and stops.
     def test_tail_static_file(self) -> None:
         # Write initial lines
         with open(self.log_file, "w", encoding="utf-8") as f:
@@ -467,6 +511,9 @@ class TestFileTailer(unittest.TestCase):
         lines = list(tailer.tail())
         self.assertEqual(lines, ["Line 1", "Line 2", "Line 3"])
 
+    # The tailer runs in a background thread. After it has read two lines, the
+    # file is truncated in place (same inode); the new line must still be seen.
+    # Timing uses short poll intervals and generous join timeouts to stay stable.
     def test_copytruncate_rotation(self) -> None:
         # Simulate logrotate copytruncate: file truncated in-place
         with open(self.log_file, "w", encoding="utf-8") as f:
@@ -501,6 +548,8 @@ class TestFileTailer(unittest.TestCase):
         self.assertIn("Initial line 2", collected)
         self.assertIn("Truncated new line", collected)
 
+    # After the rename the tailer holds the old inode; the new file at the same
+    # path has a new inode. Both files' lines must be delivered.
     def test_rename_and_recreate_rotation(self) -> None:
         # Simulate logrotate 'create' mode: mv app.log app.log.1 && touch app.log
         with open(self.log_file, "w", encoding="utf-8") as f:
@@ -537,6 +586,8 @@ class TestFileTailer(unittest.TestCase):
         self.assertIn("Old Inode Line", collected)
         self.assertIn("New Inode Line", collected)
 
+    # Replace sys.stdin with an in-memory stream, restoring it in finally so
+    # other tests are unaffected.
     def test_stdin_tailer(self) -> None:
         import io
         import sys
@@ -551,6 +602,8 @@ class TestFileTailer(unittest.TestCase):
         finally:
             sys.stdin = old_stdin
 
+    # A line written in two pieces must not be yielded early: nothing is
+    # emitted until the newline arrives, then the joined line is emitted once.
     def test_partial_line_buffering(self) -> None:
         tailer = FileTailer(
             filepath=str(self.log_file),
@@ -596,8 +649,14 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    # End-to-end outage scenario: (1) collector down -> messages spooled;
+    # (2) collector comes up on the same port; (3) a fresh shipper (simulating a
+    # restart) replays the backlog and the spool drains to zero.
     def test_store_and_forward_failover_and_replay(self) -> None:
         # Step 1: Upstream server is completely down (unbound port)
+        # A fixed port that nothing listens on, later bound by the test server so the
+        # same target config works before and after the 'recovery'. Could collide if
+        # the port happens to be in use on the host.
         dead_port = 54321
         config = ShipperConfig(
             target_host="127.0.0.1",
@@ -670,12 +729,15 @@ class TestCliInterface(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    # Parser-level check only: flags map to the expected namespace attributes.
     def test_cli_spool_status_json(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["spool-status", "--spool-dir", self.test_dir, "--json"])
         self.assertEqual(args.command, "spool-status")
         self.assertTrue(args.json)
 
+    # Drives main() end to end. Port 65432 is assumed to have no listener, so
+    # the message falls back to the spool; purge then clears it.
     def test_cli_send_and_purge(self) -> None:
         # Send message with unreachable target (will spool)
         code = main([

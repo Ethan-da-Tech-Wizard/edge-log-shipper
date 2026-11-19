@@ -55,6 +55,7 @@ LOW-LEVEL NETWORK & SOCKET PROGRAMMING CONCEPTS:
 
 from __future__ import annotations
 
+# Stdlib only: socket for TCP/UDP, random for backoff jitter.
 import random
 import socket
 import time
@@ -76,14 +77,19 @@ class SyslogTransport:
             config: ShipperConfig instance specifying target host, port, protocol, and timeouts.
         """
         self.config = config
+        # The socket is created lazily in connect(); None means 'not connected'.
         self._sock: Optional[socket.socket] = None
         self._is_connected: bool = False
+        # Consecutive failed connects; drives the exponential backoff exponent and
+        # is reset to 0 on success.
         self._reconnect_attempts: int = 0
         self._last_connect_failure: float = 0.0
 
     @property
     def is_connected(self) -> bool:
         """Return current logical connection status."""
+        # Logical state only: a peer that vanished silently is not noticed until
+        # the next send fails (keepalives bound how long that can take).
         return self._is_connected and (self._sock is not None)
 
     def _configure_tcp_socket_options(self, sock: socket.socket) -> None:
@@ -93,6 +99,8 @@ class SyslogTransport:
         # 1. Disable Nagle's Algorithm (TCP_NODELAY = 1)
         # Prevents kernel buffering of small log payloads, eliminating 40-200ms delayed ACK latency.
         try:
+            # Each option is applied in its own try/except: failure of an optional
+            # tuning knob (unsupported platform/kernel) must never prevent connecting.
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
@@ -108,6 +116,9 @@ class SyslogTransport:
         # TCP_KEEPIDLE: Seconds the connection must sit idle before OS sends keepalive probes.
         # TCP_KEEPINTVL: Interval in seconds between individual keepalive probes.
         # TCP_KEEPCNT: Number of unanswered probes before socket is pronounced dead.
+        # These constants exist on Linux but not on every platform (macOS names the
+        # idle option differently), hence the hasattr guards. With the values below a
+        # dead peer is detected after roughly 30s idle + 3 probes * 5s = ~45s.
         if hasattr(socket, "TCP_KEEPIDLE"):
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
@@ -135,15 +146,22 @@ class SyslogTransport:
         Returns:
             True if connection established successfully, False on failure.
         """
+        # Always tear down any previous socket first so reconnects never leak
+        # file descriptors.
         self.close()
 
         target = (self.config.target_host, self.config.target_port)
 
+        # Held in a local until fully set up, so a failed connect can close it
+        # without touching the previous (already closed) self._sock.
         sock: Optional[socket.socket] = None
         try:
             if self.config.protocol == "tcp":
                 # Create TCP stream socket
+                # IPv4 only (AF_INET); an IPv6-only collector address would fail to connect.
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Short connect timeout bounds how long an unreachable collector can stall
+                # the calling thread; it is swapped for the send timeout once connected.
                 sock.settimeout(self.config.connect_timeout)
 
                 # Connect to remote peer
@@ -162,6 +180,8 @@ class SyslogTransport:
 
             elif self.config.protocol == "udp":
                 # Create UDP datagram socket
+                # UDP: connect() sets a default peer and creates no handshake, so it
+                # succeeds even if nothing is listening; loss is invisible to us.
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.settimeout(self.config.send_timeout)
                 # For UDP, socket.connect() associates the socket with the remote address,
@@ -173,6 +193,8 @@ class SyslogTransport:
                 self._reconnect_attempts = 0
                 return True
 
+        # Any connection failure is converted to a False return plus bookkeeping;
+        # the shipper reacts by spooling. (socket.error is an alias of OSError.)
         except (socket.error, OSError) as exc:
             self._is_connected = False
             self._last_connect_failure = time.time()
@@ -201,9 +223,14 @@ class SyslogTransport:
         base = self.config.reconnect_backoff_initial
         mult = self.config.reconnect_backoff_multiplier
         cap = self.config.reconnect_backoff_max
+        # Clamp the exponent so multiplier ** attempt cannot overflow a float after
+        # many failures; the result is capped by reconnect_backoff_max anyway.
         attempt = min(self._reconnect_attempts, 10)  # Bound power to prevent float overflow
 
         ceiling = min(cap, base * (mult ** attempt))
+        # Full jitter with a small floor (0.1s) so the delay is never ~0. Note this
+        # differs slightly from the docstring formula, which shows a lower bound of 0.
+        # This method only computes the delay; callers decide whether to sleep.
         return random.uniform(0.1, max(0.2, ceiling))
 
     def send_bytes(self, payload: bytes) -> bool:
@@ -219,6 +246,7 @@ class SyslogTransport:
         Returns:
             True if transmission succeeded, False if socket error occurred.
         """
+        # Connect on demand, so callers never need to manage connection state.
         if not self._is_connected or self._sock is None:
             if not self.connect():
                 return False
@@ -227,10 +255,15 @@ class SyslogTransport:
             if self._sock is None:
                 return False
             # sendall() continues writing until all bytes in payload are sent or an error occurs
+            # TCP may accept only part of the buffer per call; sendall loops until all
+            # bytes are written, the timeout fires, or an error occurs. A timeout
+            # mid-write can leave a partial frame on the wire; the connection is closed
+            # below so the next send starts on a fresh stream.
             self._sock.sendall(payload)
             return True
         except (socket.error, OSError):
             # Broken pipe (EPIPE), connection reset by peer (ECONNRESET), or write timeout
+            # Drop the broken socket so the next send_bytes reconnects from scratch.
             self.close()
             return False
 
@@ -251,6 +284,8 @@ class SyslogTransport:
                 sent_count += 1
             else:
                 # On first transmission failure, return unsent remainder for spooling
+                # Stop at the first failure (do not skip ahead) so the caller can spool the
+                # remainder in its original order.
                 return sent_count, payloads[i:]
         return sent_count, []
 
@@ -259,6 +294,8 @@ class SyslogTransport:
         self._is_connected = False
         if self._sock is not None:
             try:
+                # shutdown first so the peer sees an orderly close; it raises if the socket
+                # is already dead, which is harmless here.
                 self._sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass

@@ -48,6 +48,8 @@ single-line, non-executable, human- and machine-readable log payload.
 
 from __future__ import annotations
 
+# Stdlib only; precompiled patterns below are module-level so they are built
+# once at import rather than on every message.
 import re
 from typing import Pattern
 
@@ -59,6 +61,9 @@ from typing import Pattern
 # 2. OSC (Operating System Command): ESC ] ... BEL or ESC \
 # 3. 2-character escape codes: ESC <char>
 # 4. DCS (Device Control String), PM (Privacy Message), APC (Application Program Command)
+# re.VERBOSE is used so each alternative can be annotated inline. The OSC
+# branch uses a negated class instead of '.*' to stay linear-time (no
+# backtracking blowup on hostile input) and to not run past a stray ESC.
 ANSI_ESCAPE_RE: Pattern[str] = re.compile(
     r"""
     \x1B                     # ASCII ESC character (0x1B or \033)
@@ -81,6 +86,8 @@ ANSI_ESCAPE_RE: Pattern[str] = re.compile(
 # Regex matching Unicode Bidirectional (Bidi) override and embedding code points:
 # U+202A (LRE), U+202B (RLE), U+202C (PDF), U+202D (LRO), U+202E (RLO)
 # U+2066 (LRI), U+2067 (RLI), U+2068 (FSI), U+2069 (PDI)
+# Matches the explicit directional formatting characters only; ordinary
+# right-to-left scripts (Arabic, Hebrew) are left intact.
 BIDI_OVERRIDES_RE: Pattern[str] = re.compile(
     r"[\u202A-\u202E\u2066-\u2069]"
 )
@@ -110,6 +117,8 @@ class LogSanitizer:
             preserve_tabs: If True, preserves horizontal tabs ('\\t'); if False, escapes them.
             max_message_length: Bounds maximum payload size to prevent memory exhaustion / DoS.
         """
+        # Plain attribute storage: the instance is stateless between calls, so one
+        # LogSanitizer can be shared safely across the shipper's lifetime.
         self.strip_ansi = strip_ansi
         self.escape_newlines = escape_newlines
         self.strip_bidi = strip_bidi
@@ -133,14 +142,21 @@ class LogSanitizer:
         Returns:
             Sanitized, single-line safe text string.
         """
+        # Empty/None input short-circuits to an empty string.
         if not raw_input:
             return ""
 
         # Step 1: Enforce maximum message length constraint
+        # Truncate BEFORE running regexes so the cost of scrubbing is bounded by
+        # max_message_length regardless of how large the attacker's input is.
+        # str() tolerates non-string inputs such as bytes-like objects or numbers.
         text = str(raw_input)[: self.max_message_length]
 
         # Step 2: Strip ANSI escape sequences (CSI, OSC, etc.)
         if self.strip_ansi:
+            # ANSI removal precedes newline/control-char escaping on purpose: otherwise
+            # the ESC byte would be turned into a visible '\x1b' and the rest of the
+            # sequence would survive as junk text.
             text = ANSI_ESCAPE_RE.sub("", text)
 
         # Step 3: Strip Unicode Bidirectional (Bidi) spoofing characters
@@ -150,6 +166,9 @@ class LogSanitizer:
         # Step 4: Handle line-splitting characters (\r and \n)
         if self.escape_newlines:
             # Replace carriage return and line feed with literal representations
+            # CRLF is replaced first so a Windows line ending becomes one '\n' token
+            # rather than '\r' + '\n'. The replacements are literal backslash
+            # sequences, keeping the output on a single physical line.
             text = text.replace("\r\n", "\\n").replace("\r", "\\r").replace("\n", "\\n")
         else:
             # Replace newlines with single spaces to keep output continuous
@@ -157,6 +176,8 @@ class LogSanitizer:
 
         # Step 5: Sanitize low-order ASCII control characters (0x00 - 0x1F) and DEL (0x7F)
         # Tab (\t) can optionally be preserved for structured TSV or tabular logs.
+        # Build in a list and join once; repeated string concatenation would be
+        # quadratic on large messages.
         cleaned_chars = []
         for ch in text:
             code = ord(ch)
@@ -165,6 +186,9 @@ class LogSanitizer:
                     cleaned_chars.append("\t")
                 else:
                     cleaned_chars.append("\\t")
+            # Hex-escape rather than delete so analysts can still see that a control
+            # character was present. (CR/LF already handled above unless escaping is
+            # disabled, in which case they were turned into spaces.)
             elif code < 32 or code == 127:
                 # Replace non-printable control char with hex escape sequence (e.g. \x00, \x07)
                 cleaned_chars.append(f"\\x{code:02x}")
@@ -175,6 +199,7 @@ class LogSanitizer:
 
 
 # Default module-level singleton instance for zero-allocation reuse
+# Shared default instance used by the fast path of sanitize_log_message.
 _DEFAULT_SANITIZER = LogSanitizer()
 
 
@@ -196,6 +221,9 @@ def sanitize_log_message(
     Returns:
         Sanitized, line-safe log string.
     """
+    # Fast path: these are exactly the defaults, so reuse the shared instance.
+    # Any other combination needs its own configured sanitizer (note that
+    # strip_bidi and max_message_length keep their defaults in that case).
     if strip_ansi and escape_newlines and preserve_tabs:
         return _DEFAULT_SANITIZER.sanitize(message)
     

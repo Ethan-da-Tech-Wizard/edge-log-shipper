@@ -1,12 +1,16 @@
+# Packaging metadata for edge-log-shipper (PEP 621). No runtime dependencies.
 [build-system]
+# Minimum setuptools version that understands the [project] table.
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+# Core project metadata shown on package indexes and by pip.
 [project]
 name = "edge-log-shipper"
 version = "1.0.0"
 description = "Python project for shipping log messages and managing a local spool."
 readme = "README.md"
+# Matches the oldest interpreter in the classifiers below.
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
@@ -40,11 +44,14 @@ classifiers = [
     "Topic :: System :: Networking",
     "Topic :: Security",
 ]
+# Intentionally empty: the shipper is standard-library only.
 dependencies = []
 
+# Installs an 'edgeshipper' command that calls edgeshipper.cli:main.
 [project.scripts]
 edgeshipper = "edgeshipper.cli:main"
 
+# Package only the edgeshipper package; keeps tests/ out of the distribution.
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["edgeshipper*"]

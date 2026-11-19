@@ -30,6 +30,8 @@ The Shipper enforces strict causal FIFO ordering:
 
 from __future__ import annotations
 
+# Stdlib only. Note: signal/sys/typing helpers are imported for the daemon
+# plumbing; the core pipeline below uses only time and our own modules.
 import logging
 import signal
 import sys
@@ -42,6 +44,8 @@ from edgeshipper.spooler import SpoolQueue
 from edgeshipper.tailer import FileTailer, StdinTailer
 from edgeshipper.transport import SyslogTransport
 
+# Library-style logger: no handlers are attached here, so the host
+# application decides where (or whether) diagnostics are emitted.
 logger = logging.getLogger("edgeshipper")
 
 
@@ -58,13 +62,20 @@ class EdgeShipper:
             config: Operational configuration settings. Uses defaults if omitted.
         """
         self.config = config or ShipperConfig()
+        # None (rather than a no-op sanitizer) lets ship_message skip the work
+        # entirely when the operator passed --no-sanitize.
         self.sanitizer = LogSanitizer() if self.config.sanitize else None
+        # The spooler is created eagerly so a backlog left by a previous run
+        # (crash, reboot) is visible to the FIFO check immediately.
         self.spooler = SpoolQueue(
             spool_dir=self.config.spool_dir,
             max_spool_bytes=self.config.max_spool_bytes,
             max_spool_entries=self.config.max_spool_entries,
         )
+        # Constructing the transport does not connect; the socket is opened lazily
+        # on first send so startup never blocks on an unreachable collector.
         self.transport = SyslogTransport(self.config)
+        # Cooperative stop flag checked by run_stream between lines.
         self._is_running: bool = False
 
     def ship_message(
@@ -100,6 +111,8 @@ class EdgeShipper:
             message=msg_text,
             facility=facility if facility is not None else self.config.facility,
             severity=severity if severity is not None else self.config.severity,
+            # Capture the event time here, before any spooling delay, so a replayed
+            # record carries its original time rather than the time it was delivered.
             timestamp=timestamp or time.time(),
             app_name=app_name or self.config.app_name,
         )
@@ -107,10 +120,15 @@ class EdgeShipper:
         # Step 3: Check FIFO ordering constraint
         # If older records are already queued in the spool buffer, this new record MUST
         # be appended to the spool queue first to prevent timeline inversion.
+        # Presence of ANY backlog diverts new records into the spool; this is what
+        # keeps delivery order identical to arrival order after an outage.
         spool_status = self.spooler.status()
         if spool_status["pending_count"] > 0:
             self.spooler.enqueue(log_entry)
             # Attempt opportunistic drain of backlog
+            # Opportunistic, bounded drain so a recovered link catches up gradually
+            # while the stream keeps flowing; a failure here simply leaves records
+            # queued for the next attempt.
             self.flush_spool(batch_size=50)
             return True
 
@@ -120,11 +138,15 @@ class EdgeShipper:
             framing=self.config.framing,
         )
 
+        # send_bytes returns False on failure (it makes one reconnect attempt itself
+        # and swallows socket errors rather than raising), which triggers the spool fallback below.
         sent = self.transport.send_bytes(wire_bytes)
         if sent:
             return True
 
         # Step 5: Socket send failed: Buffer into store-and-forward spooler
+        # Returning True here means 'accepted for delivery' (spooled), not
+        # 'delivered'; callers can inspect the spooler status to tell the two apart.
         self.spooler.enqueue(log_entry)
         return True
 
@@ -138,11 +160,15 @@ class EdgeShipper:
         Returns:
             Count of successfully transmitted and acknowledged records.
         """
+        # peek reads without removing: records are only deleted via acknowledge()
+        # AFTER a successful send, giving at-least-once delivery across crashes.
         entries = self.spooler.peek(limit=batch_size)
         if not entries:
             return 0
 
         # Attempt to ensure transport connection is active
+        # Probe the connection once up front so an unreachable collector costs a
+        # single failed connect per flush instead of one per spooled record.
         if not self.transport.is_connected:
             if not self.transport.connect():
                 return 0
@@ -158,12 +184,16 @@ class EdgeShipper:
                 successfully_sent += 1
             else:
                 # Network failed mid-batch: increment failure attempts and halt flush
+                # Everything from the failing record onward is still pending; bump their
+                # attempt counters and stop so order is preserved (no skipping ahead).
                 failed_ids = [e.id for e in entries[successfully_sent:]]
                 self.spooler.increment_attempts(failed_ids)
                 break
 
         # Atomically acknowledge and remove all delivered entries from disk
         if successfully_sent > 0:
+            # Acknowledge a count, not ids: delivery is strictly head-first, so the
+            # first N spooled entries are exactly the ones just sent.
             self.spooler.acknowledge(successfully_sent)
 
         return successfully_sent
@@ -176,6 +206,8 @@ class EdgeShipper:
             line_iterator: Generator yielding individual log lines.
         """
         self._is_running = True
+        # Throttle for the periodic backlog drain below, so we do not stat the
+        # spool directory on every single line of a busy stream.
         last_flush_check = time.time()
 
         try:
@@ -193,15 +225,20 @@ class EdgeShipper:
                     if spool_stat["pending_count"] > 0:
                         self.flush_spool(batch_size=100)
 
+        # Always run close() so the last spooled records get a final flush and the
+        # socket is released, even when the iterator raises.
         finally:
             self.close()
 
     def close(self) -> None:
         """Cleanly stop the shipper and close transport resources."""
+        # Clear first so a concurrent run_stream loop stops accepting more lines.
         self._is_running = False
         # Attempt a final flush of any remaining pending records
         try:
             self.flush_spool(batch_size=200)
+        # Shutdown is best-effort: an unreachable collector must not prevent the
+        # socket from being closed. Unsent records stay safely on disk.
         except Exception:
             pass
         self.transport.close()

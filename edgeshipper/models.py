@@ -19,6 +19,8 @@ Zero external dependencies: Built strictly with Python 3 standard library module
 
 from __future__ import annotations
 
+# Only stdlib imports: time/datetime/socket supply the dynamic header fields,
+# json + dataclasses handle the on-disk spool representation.
 import datetime
 import json
 import os
@@ -32,6 +34,8 @@ from typing import Any, Dict, Optional, Union
 # Facilities categorize the system subsystem that originated the log event.
 # Numerical code mapping adheres strictly to RFC 5424 Section 6.2.1.
 # ==============================================================================
+# Name -> code lookup. Used for CLI input; accepts the traditional names plus
+# the Linux-specific 'security'/'console' aliases for facilities 13 and 14.
 FACILITY_MAP: Dict[str, int] = {
     "kern": 0,       # Kernel messages
     "user": 1,       # User-level messages (default for applications)
@@ -60,6 +64,7 @@ FACILITY_MAP: Dict[str, int] = {
 }
 
 # Reverse facility mapping for human-readable introspection
+# Built by inversion; where codes are unique each maps to its single name.
 FACILITY_REVERSE_MAP: Dict[int, str] = {v: k for k, v in FACILITY_MAP.items()}
 
 # ==============================================================================
@@ -67,6 +72,8 @@ FACILITY_REVERSE_MAP: Dict[int, str] = {v: k for k, v in FACILITY_MAP.items()}
 # Severities describe the urgency and impact level of the logged condition.
 # Numerical code mapping adheres strictly to RFC 5424 Section 6.2.1.
 # ==============================================================================
+# Several spellings (e.g. 'err'/'error', 'warn'/'warning') map to the same
+# code because different tools use different conventions.
 SEVERITY_MAP: Dict[str, int] = {
     "emerg": 0,    # System is unusable (panic)
     "emergency": 0,
@@ -84,6 +91,8 @@ SEVERITY_MAP: Dict[str, int] = {
 }
 
 # Reverse severity mapping
+# Written out by hand (not inverted) so each code maps to its canonical short
+# name rather than whichever alias happens to come last in SEVERITY_MAP.
 SEVERITY_REVERSE_MAP: Dict[int, str] = {
     0: "emerg",
     1: "alert",
@@ -109,10 +118,14 @@ def parse_facility(val: Union[str, int]) -> int:
     Raises:
         ValueError: If facility name or number is unrecognized/out-of-bounds.
     """
+    # Integers are range-checked directly. bool is an int subclass, so
+    # True/False would pass as 1/0; callers are not expected to pass them.
     if isinstance(val, int):
         if 0 <= val <= 23:
             return val
         raise ValueError(f"Syslog facility code {val} out of bounds (must be 0-23)")
+    # Normalize so ' Local0 ' and 'LOCAL0' behave the same as 'local0'.
+    # Numeric strings (e.g. from argparse) are accepted too.
     norm = str(val).strip().lower()
     if norm.isdigit():
         code = int(norm)
@@ -185,13 +198,18 @@ class LogMessage:
         Ensures timestamps and host identities are deterministically initialized.
         """
         if self.timestamp is None:
+            # Timestamp is captured at construction time (not at send time) so a spooled
+            # message keeps the moment the event actually happened across retries.
             self.timestamp = time.time()
         if self.hostname is None:
             try:
+                # gethostname can fail in stripped-down containers; fall back to a fixed name
+                # rather than losing the log record.
                 self.hostname = socket.gethostname()
             except Exception:
                 self.hostname = "localhost"
         if self.procid is None:
+            # Stored as a string because the RFC 5424 PROCID field is free text.
             self.procid = str(os.getpid())
 
     def calculate_pri(self) -> int:
@@ -204,6 +222,7 @@ class LogMessage:
             Facility 1 (user) * 8 + Severity 6 (info) = 8 + 6 = 14.
             Enclosed in wire format as: <14>
         """
+        # Facility occupies the upper bits and severity the low 3 bits (0-7), hence *8.
         return (self.facility * 8) + self.severity
 
     # Step 2: Encode message according to RFC 5424 modern structured syslog specification
@@ -231,10 +250,15 @@ class LogMessage:
 
         # Format timestamp to ISO 8601 UTC with microsecond precision:
         # Example: 2026-11-08T07:45:00.123456+00:00 or with trailing Z
+        # RFC 5424 requires an unambiguous timestamp; always render in UTC with a
+        # literal 'Z' so collectors never have to guess the sender's timezone.
         dt = datetime.datetime.fromtimestamp(self.timestamp or time.time(), tz=datetime.timezone.utc)
         iso_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
         # Sanitize metadata fields to avoid whitespace delimiters breaking RFC parser
+        # Header fields are space-delimited, so embedded spaces would shift every
+        # field after them; replace with '_' and truncate to the RFC length limits
+        # (HOSTNAME 255, APP-NAME 48, PROCID 128, MSGID 32). '-' is the NILVALUE.
         host = (self.hostname or "-").replace(" ", "_")[:255]
         app = (self.app_name or "-").replace(" ", "_")[:48]
         pid = (self.procid or "-").replace(" ", "_")[:128]
@@ -242,6 +266,8 @@ class LogMessage:
         sd = self.structured_data if self.structured_data else "-"
 
         # Assemble RFC 5424 header and payload
+        # The MSG part is optional in RFC 5424, so an empty message omits the
+        # trailing space+body entirely.
         header = f"<{pri}>{version} {iso_ts} {host} {app} {pid} {mid} {sd}"
         if self.message:
             return f"{header} {self.message}"
@@ -259,6 +285,8 @@ class LogMessage:
         (e.g. 'Oct  5' instead of 'Oct 05') and lacks timezone offsets.
         """
         pri = self.calculate_pri()
+        # RFC 3164 has no timezone field, so the timestamp is rendered in the
+        # sender's local time, which is what BSD syslog receivers expect.
         dt = datetime.datetime.fromtimestamp(self.timestamp or time.time())
         
         # Format BSD style date: 'Mmm dd hh:mm:ss' with space-padding for days < 10
@@ -294,6 +322,9 @@ class LogMessage:
         else:
             text = self.format_rfc5424()
 
+        # Encode first so the octet count is measured in bytes, not characters
+        # (multi-byte UTF-8 would otherwise make the prefix wrong). 'replace' avoids
+        # raising on lone surrogates.
         payload_bytes = text.encode("utf-8", errors="replace")
 
         if framing.lower() == "octet":
@@ -304,18 +335,22 @@ class LogMessage:
             return length_prefix + payload_bytes
         else:
             # Non-transparent framing with newline delimiter
+            # Avoid doubling the terminator if the message body already ends in one.
             if not payload_bytes.endswith(b"\n"):
                 return payload_bytes + b"\n"
             return payload_bytes
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert log record to dictionary for local JSON spooling serialization."""
+        # asdict recurses into nested dataclasses; all fields are JSON-safe primitives.
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LogMessage:
         """Hydrate a LogMessage instance from serialized dictionary."""
         return cls(
+            # Use .get with defaults so spool files written by older versions (missing
+            # newer fields) still load instead of crashing the replay.
             message=data.get("message", ""),
             facility=data.get("facility", 1),
             severity=data.get("severity", 6),
@@ -356,6 +391,8 @@ class SpoolEntry:
     @classmethod
     def from_json(cls, json_str: str) -> SpoolEntry:
         """Parse serialized JSON string into a SpoolEntry."""
+        # Required keys (id, created_at, log_message) raise KeyError if missing; the
+        # spooler treats that as a corrupt record.
         data = json.loads(json_str)
         return cls(
             id=data["id"],
@@ -395,6 +432,8 @@ class ShipperConfig:
     syslog_format: str = "rfc5424"
     framing: str = "octet"
     spool_dir: str = "/tmp/edgeshipper_spool"
+    # Spool limits protect small edge devices from filling their disk during a
+    # long upstream outage; the spooler enforces them with drop-oldest.
     max_spool_bytes: int = 50 * 1024 * 1024  # 50 MB disk cap
     max_spool_entries: int = 100_000
     connect_timeout: float = 3.0

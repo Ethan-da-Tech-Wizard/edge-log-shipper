@@ -32,6 +32,8 @@ The Store-and-Forward Spooler resolves this through a persistent disk-backed FIF
 
 from __future__ import annotations
 
+# Stdlib only: json for the JSONL journal/metadata, threading for the mutex,
+# uuid for entry ids, pathlib/os/time for file handling.
 import json
 import os
 import shutil
@@ -66,32 +68,45 @@ class SpoolQueue:
             sync_to_disk: If True, calls os.fsync on every append (maximum durability at
                           cost of write I/O operations). Defaults to False (uses OS page cache).
         """
+        # Resolve to an absolute path so later chdir() calls or relative inputs
+        # cannot silently move the spool.
         self.spool_dir = Path(spool_dir).resolve()
         self.max_spool_bytes = max_spool_bytes
         self.max_spool_entries = max_spool_entries
         self.sync_to_disk = sync_to_disk
 
         # Ensure directory exists with restrictive POSIX permissions (0700)
+        # Mode 0700 below: spooled logs may contain sensitive data, so only the
+        # owning user should be able to read them.
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         try:
             os.chmod(self.spool_dir, 0o700)
         except OSError:
             pass  # Non-POSIX or restricted permission environments
 
+        # Two files: the journal holds one JSON record per line (the source of
+        # truth for pending entries); the meta file holds cumulative counters.
         self.journal_path = self.spool_dir / "spool_journal.jsonl"
         self.meta_path = self.spool_dir / "spool_meta.json"
 
         # Concurrency control: Mutex prevents concurrent threads from corrupting
         # journal file pointers and metadata state.
+        # A plain (non-reentrant) Lock: every public method takes it once, and the
+        # *_unlocked helpers assume the caller already holds it. Never call a public
+        # method from inside an *_unlocked helper or it will deadlock.
         self._lock = threading.Lock()
 
         # Internal in-memory index of unacknowledged entries: list of SpoolEntry
+        # The full pending backlog is mirrored in memory (bounded by
+        # max_spool_entries) so peek/status never need to re-read the journal.
         self._entries: List[SpoolEntry] = []
         self._dropped_count: int = 0
         self._total_enqueued: int = 0
         self._total_drained: int = 0
 
         # Load persisted backlog and metadata upon startup
+        # Recovery happens in the constructor so a restarted daemon resumes with
+        # the backlog the previous run left behind.
         self._initialize_from_disk()
 
     def _initialize_from_disk(self) -> None:
@@ -101,6 +116,8 @@ class SpoolQueue:
         and loads cumulative telemetry metrics from the metadata file.
         """
         with self._lock:
+            # Metadata is advisory telemetry, so a corrupt file just resets counters
+            # while the journal (the real data) is still loaded below.
             # 1. Load cumulative metadata counters if present
             if self.meta_path.exists():
                 try:
@@ -115,6 +132,8 @@ class SpoolQueue:
                     self._total_enqueued = 0
                     self._total_drained = 0
 
+            # Line-by-line parsing means a torn final line (power loss mid-write) only
+            # costs that one record; every earlier record is still recovered.
             # 2. Rehydrate uncommitted entries from the append-only journal
             self._entries.clear()
             if self.journal_path.exists():
@@ -133,6 +152,7 @@ class SpoolQueue:
                 except Exception:
                     pass
 
+            # The limits may have been lowered since the last run, so re-apply them.
             # Enforce backpressure capacity immediately after load
             self._enforce_capacity_unlocked()
 
@@ -141,6 +161,8 @@ class SpoolQueue:
         Write metadata state atomically using write-and-rename pattern.
         This guarantees that an unexpected reboot never leaves a half-written JSON file.
         """
+        # Write-then-rename: readers (and a crash) see either the complete old file
+        # or the complete new one, never a partial write.
         tmp_meta = self.meta_path.with_suffix(".tmp")
         try:
             with open(tmp_meta, "w", encoding="utf-8") as f:
@@ -155,8 +177,12 @@ class SpoolQueue:
                 if self.sync_to_disk:
                     os.fsync(f.fileno())
             # Atomic filesystem rename replaces target atomically in POSIX
+            # Path.replace is an atomic rename on POSIX when both paths are on the same
+            # filesystem, which holds here since the temp file sits beside the target.
             tmp_meta.replace(self.meta_path)
         except Exception:
+            # Best-effort cleanup; metadata failures are non-fatal because counters are
+            # only telemetry.
             if tmp_meta.exists():
                 try:
                     tmp_meta.unlink()
@@ -169,15 +195,22 @@ class SpoolQueue:
         When bounds are exceeded, drops the oldest records (FIFO eviction).
         Caller must hold self._lock.
         """
+        # Rewriting the journal is expensive, so only do it when something was
+        # actually evicted.
         need_compaction = False
 
         # Check entry count ceiling
+        # Backpressure policy is drop-oldest: for logs the newest events are
+        # usually the most valuable, and the node must never fill its disk.
         while len(self._entries) > self.max_spool_entries:
             self._entries.pop(0)  # Evict oldest entry
             self._dropped_count += 1
             need_compaction = True
 
         # Check total estimated byte quota
+        # The byte quota is measured from the on-disk file sizes. The journal file
+        # is only shrunk by _rewrite_journal_unlocked, which runs after this loop,
+        # so the measured size does not change while entries are being evicted.
         current_disk_bytes = self.get_disk_usage_unlocked()
         while current_disk_bytes > self.max_spool_bytes and self._entries:
             self._entries.pop(0)
@@ -189,6 +222,9 @@ class SpoolQueue:
             self._rewrite_journal_unlocked()
             self._save_meta_unlocked()
 
+    # Compaction = write all surviving entries to a temp file, then atomically
+    # replace the journal. Used after eviction, acknowledgement and attempt-count
+    # updates, so the journal always matches the in-memory list.
     def _rewrite_journal_unlocked(self) -> None:
         """
         Atomically compact the journal file, writing only active entries.
@@ -221,6 +257,8 @@ class SpoolQueue:
         Returns:
             The created SpoolEntry containing assigned unique ID.
         """
+        # 16 hex chars (64 bits of randomness) is ample to be unique within one
+        # bounded spool and keeps journal lines compact.
         entry_id = uuid.uuid4().hex[:16]
         entry = SpoolEntry(
             id=entry_id,
@@ -235,6 +273,8 @@ class SpoolQueue:
             # - Write buffer flush ensures userspace C stdio buffers are passed to kernel page cache.
             # - os.fsync() forces kernel to commit dirty pages to non-volatile physical storage,
             #   preventing data loss during immediate power loss at the cost of disk I/O latency.
+            # Append mode: a crash can at worst leave one truncated last line, which
+            # the loader skips. Append is cheap compared with rewriting the file.
             serialized_line = entry.to_json() + "\n"
             with open(self.journal_path, "a", encoding="utf-8") as f:
                 f.write(serialized_line)
@@ -242,6 +282,7 @@ class SpoolQueue:
                 if self.sync_to_disk:
                     os.fsync(f.fileno())
 
+            # Keep the in-memory index in step with the journal under the same lock.
             self._entries.append(entry)
             self._total_enqueued += 1
 
@@ -265,6 +306,7 @@ class SpoolQueue:
             List of SpoolEntry records.
         """
         with self._lock:
+            # Return a copy so callers cannot mutate the queue's internal list.
             return list(self._entries[:limit])
 
     def acknowledge(self, count: int) -> int:
@@ -282,8 +324,11 @@ class SpoolQueue:
             return 0
 
         with self._lock:
+            # Clamp so over-acknowledging cannot raise or corrupt the counters.
             actual_count = min(count, len(self._entries))
             if actual_count > 0:
+                # FIFO: acknowledgement always removes from the head, matching the order
+                # in which flush_spool transmitted them.
                 del self._entries[:actual_count]
                 self._total_drained += actual_count
 
@@ -301,6 +346,7 @@ class SpoolQueue:
         Parameters:
             entry_ids: List of SpoolEntry IDs whose transmission failed.
         """
+        # Set membership makes the scan below O(n) rather than O(n*m).
         id_set = set(entry_ids)
         with self._lock:
             modified = False
@@ -311,6 +357,7 @@ class SpoolQueue:
             if modified:
                 self._rewrite_journal_unlocked()
 
+    # Counts only the journal and meta files, not the directory as a whole.
     def get_disk_usage_unlocked(self) -> int:
         """Calculate total byte footprint of spool files on disk. Caller holds lock."""
         total = 0
@@ -336,6 +383,8 @@ class SpoolQueue:
         with self._lock:
             disk_bytes = self.get_disk_usage_unlocked()
             pending_count = len(self._entries)
+            # Age of the head entry shows how long the backlog has been stuck, which is
+            # the most useful single health signal for an outage.
             oldest_age = 0.0
             if self._entries:
                 oldest_age = max(0.0, time.time() - self._entries[0].created_at)
@@ -353,6 +402,8 @@ class SpoolQueue:
                 "oldest_entry_age_seconds": round(oldest_age, 2),
             }
 
+    # Destructive and irreversible: deletes the journal and metadata and zeroes
+    # all counters (including the lifetime dropped/enqueued/drained totals).
     def purge(self) -> None:
         """Completely purge all spool data and reset telemetry counters."""
         with self._lock:

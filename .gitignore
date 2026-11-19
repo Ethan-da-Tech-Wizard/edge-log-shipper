@@ -1,8 +1,10 @@
+# Python bytecode and compiled extensions
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+# Build and packaging output
 build/
 develop-eggs/
 dist/
@@ -18,8 +20,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+# Test and coverage artifacts
 .pytest_cache/
 .coverage
 htmlcov/
+# Runtime logs and OS metadata
 *.log
 .DS_Store

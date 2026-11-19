@@ -57,6 +57,8 @@ subtleties that naive `file.read()` loops fail to handle:
 
 from __future__ import annotations
 
+# Stdlib only. os.fstat/os.stat provide the inode and size information that
+# rotation detection depends on.
 import os
 import sys
 import time
@@ -87,14 +89,20 @@ class FileTailer:
                           (ignoring historical lines). If False, starts from byte 0.
             poll_interval: Sleep duration in seconds between idle filesystem checks.
         """
+        # Resolved once at construction. Note this follows symlinks at that moment;
+        # if a symlink is later repointed, the tailer keeps watching the resolved target.
         self.filepath = Path(filepath).resolve()
         self.follow = follow
         self.start_at_end = start_at_end
         self.poll_interval = poll_interval
 
+        # Open file object (None until the file first appears).
         self._file_handle = None
+        # (device, inode) uniquely identify a file on a host; inode numbers alone
+        # can repeat across filesystems, so the device id is tracked as well.
         self._current_inode: Optional[int] = None
         self._current_dev: Optional[int] = None
+        # Holds the unterminated tail of the last read until its newline arrives.
         self._buffer: str = ""
         self._should_stop: bool = False
 
@@ -109,12 +117,18 @@ class FileTailer:
         Returns:
             True if file opened successfully, False if file does not exist yet.
         """
+        # A missing file is not an error: the log may not have been created yet,
+        # so the caller polls until it appears.
         if not self.filepath.exists():
             return False
 
         try:
             # Open file in binary or text mode with explicit utf-8 handling
+            # Text mode with errors='replace' so a byte sequence that is not valid UTF-8
+            # becomes U+FFFD instead of raising and killing the tail loop.
             f = open(self.filepath, "r", encoding="utf-8", errors="replace")
+            # fstat the open descriptor (not the path) so the recorded identity is
+            # that of the file we actually hold, even if the path is swapped meanwhile.
             stat_info = os.fstat(f.fileno())
 
             self._file_handle = f
@@ -122,6 +136,8 @@ class FileTailer:
             self._current_dev = stat_info.st_dev
 
             # If instructed to start at end (tail -f behavior), seek to current EOF
+            # Skipping history on start mirrors 'tail -f' and avoids re-shipping old
+            # logs every time the daemon restarts.
             if self.start_at_end:
                 f.seek(0, os.SEEK_END)
 
@@ -147,10 +163,14 @@ class FileTailer:
         try:
             # Check status of currently open file handle
             current_fstat = os.fstat(self._file_handle.fileno())
+            # tell() is the position of our next read; compared with the file size
+            # below to spot in-place truncation.
             current_offset = self._file_handle.tell()
 
             # Case A: Truncation detection ('copytruncate')
             # If current file size is smaller than our read offset, the file was truncated.
+            # Size smaller than our offset can only mean the file was truncated (the
+            # copytruncate strategy). Restart from the top of the new content.
             if current_fstat.st_size < current_offset:
                 # Seek to beginning of the truncated file
                 self._file_handle.seek(0, os.SEEK_SET)
@@ -158,11 +178,16 @@ class FileTailer:
 
             # Case B: Inode divergence ('create' / rename rotation)
             # Check what inode is currently located at self.filepath on disk
+            # If the path is momentarily missing (mid-rotation), keep reading the old
+            # handle and re-check on the next poll.
             if self.filepath.exists():
                 path_stat = self.filepath.stat()
                 if path_stat.st_ino != self._current_inode or path_stat.st_dev != self._current_dev:
                     # Inode has changed! A new file was placed at this path.
                     # Drain any remaining bytes from the old file handle first:
+                    # Lines written to the old file just before rotation would be lost if we
+                    # switched handles immediately, so read to EOF first. They are appended to
+                    # the partial-line buffer and complete on the next yield.
                     trailing_data = self._file_handle.read()
                     if trailing_data:
                         self._buffer += trailing_data
@@ -174,6 +199,8 @@ class FileTailer:
                         pass
 
                     # Open new file handle at target path
+                    # Start the new file at offset 0: everything in a freshly rotated-in file
+                    # is new data.
                     new_f = open(self.filepath, "r", encoding="utf-8", errors="replace")
                     new_stat = os.fstat(new_f.fileno())
                     self._file_handle = new_f
@@ -182,6 +209,8 @@ class FileTailer:
                     self._file_handle.seek(0, os.SEEK_SET)
                     return True
 
+        # Transient stat/read errors during rotation are ignored; the next poll
+        # retries the check.
         except (OSError, IOError):
             pass
 
@@ -195,6 +224,8 @@ class FileTailer:
             Complete, individual log lines (without trailing newline).
         """
         # Wait for file to appear if it does not yet exist
+        # Block until the file exists (follow mode); one-shot mode gives up
+        # immediately if it is absent.
         while not self._open_file() and not self._should_stop:
             if not self.follow:
                 return
@@ -203,6 +234,8 @@ class FileTailer:
         try:
             while not self._should_stop:
                 # Check for log rotation or truncation before each read pass
+                # Rotation is checked every loop iteration, i.e. at most poll_interval
+                # behind the event.
                 self._check_rotation()
 
                 if self._file_handle is None:
@@ -211,11 +244,15 @@ class FileTailer:
                         continue
 
                 # Read available chunk from file handle
+                # readline returns whatever is available up to a newline; a result with no
+                # newline means the writer has not finished the line yet.
                 chunk = self._file_handle.readline()
 
                 if chunk:
                     # If chunk ends with newline, we have a complete line
                     if chunk.endswith("\n") or chunk.endswith("\r"):
+                        # Prepend any buffered fragment so a line split across reads (or across a
+                        # rotation) is delivered intact.
                         complete_line = self._buffer + chunk.rstrip("\r\n")
                         self._buffer = ""
                         yield complete_line
@@ -224,6 +261,7 @@ class FileTailer:
                         self._buffer += chunk
                 else:
                     # Reached EOF of currently available data
+                    # Non-follow mode: emit a final unterminated line (if any) then stop.
                     if not self.follow:
                         # Flush any remaining buffer on non-follow exit
                         if self._buffer:
@@ -232,6 +270,8 @@ class FileTailer:
                         break
 
                     # Idle sleep before next poll to prevent busy-waiting / 100% CPU burn
+                    # Polling (not inotify) keeps the module portable and dependency-free; the
+                    # sleep prevents a busy loop at 100% CPU.
                     time.sleep(self.poll_interval)
 
         finally:
@@ -249,6 +289,7 @@ class StdinTailer:
     Enables piping pipelines: `journalctl -f | edgeshipper tail` or `cat access.log | edgeshipper`.
     """
 
+    # No state beyond the stop flag; stdin is read lazily in stream().
     def __init__(self) -> None:
         self._should_stop = False
 
@@ -264,11 +305,15 @@ class StdinTailer:
             Complete lines stripped of trailing newlines.
         """
         try:
+            # Iterating sys.stdin blocks until a line arrives and ends at EOF (e.g. when
+            # the upstream pipe closes).
             for line in sys.stdin:
                 if self._should_stop:
                     break
                 clean_line = line.rstrip("\r\n")
+                # Blank lines are skipped. (FileTailer, by contrast, yields them as-is.)
                 if clean_line:
                     yield clean_line
+        # Ctrl-C and a closed pipe are normal ways for a stream to end.
         except (KeyboardInterrupt, BrokenPipeError):
             pass
