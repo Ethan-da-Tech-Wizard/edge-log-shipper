@@ -275,6 +275,25 @@ class TestSpoolQueue(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    # Regression: the byte quota used to be measured from the on-disk size, which
+    # does not shrink while entries are evicted, so one overage evicted everything.
+    # Only as many head entries as needed to get under quota may be dropped.
+    def test_byte_quota_evicts_only_what_is_needed(self) -> None:
+        probe = SpoolQueue(spool_dir=self.test_dir)
+        entry = probe.enqueue(LogMessage(message="x" * 200))
+        line_bytes = len((entry.to_json() + "\n").encode("utf-8"))
+        probe.purge()
+
+        # Quota fits about five lines (meta file is small but counted too).
+        queue = SpoolQueue(spool_dir=self.test_dir, max_spool_bytes=line_bytes * 5 + 300)
+        for _ in range(12):
+            queue.enqueue(LogMessage(message="x" * 200))
+
+        status = queue.status()
+        self.assertGreaterEqual(status["pending_count"], 3)
+        self.assertLessEqual(status["pending_count"], 5)
+        self.assertEqual(status["pending_count"] + status["dropped_count"], 12)
+
     # Core FIFO contract: peek does not remove, acknowledge removes from the
     # head, and the telemetry counters track both.
     def test_enqueue_peek_and_acknowledge(self) -> None:

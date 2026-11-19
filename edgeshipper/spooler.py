@@ -208,15 +208,16 @@ class SpoolQueue:
             need_compaction = True
 
         # Check total estimated byte quota
-        # The byte quota is measured from the on-disk file sizes. The journal file
-        # is only shrunk by _rewrite_journal_unlocked, which runs after this loop,
-        # so the measured size does not change while entries are being evicted.
+        # The on-disk journal is only shrunk by _rewrite_journal_unlocked, which runs
+        # after this loop, so re-stat'ing the file would never show progress and the
+        # loop would evict every entry. Instead measure once, then subtract the
+        # serialized size (JSON line plus newline, in UTF-8) of each evicted entry.
         current_disk_bytes = self.get_disk_usage_unlocked()
         while current_disk_bytes > self.max_spool_bytes and self._entries:
-            self._entries.pop(0)
+            evicted = self._entries.pop(0)
+            current_disk_bytes -= len((evicted.to_json() + "\n").encode("utf-8"))
             self._dropped_count += 1
             need_compaction = True
-            current_disk_bytes = self.get_disk_usage_unlocked()
 
         if need_compaction:
             self._rewrite_journal_unlocked()
