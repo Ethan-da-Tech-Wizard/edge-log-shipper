@@ -231,6 +231,10 @@ class SpoolQueue:
 
         with self._lock:
             # Append serialized record to active journal
+            # Disk Durability Strategy:
+            # - Write buffer flush ensures userspace C stdio buffers are passed to kernel page cache.
+            # - os.fsync() forces kernel to commit dirty pages to non-volatile physical storage,
+            #   preventing data loss during immediate power loss at the cost of disk I/O latency.
             serialized_line = entry.to_json() + "\n"
             with open(self.journal_path, "a", encoding="utf-8") as f:
                 f.write(serialized_line)
