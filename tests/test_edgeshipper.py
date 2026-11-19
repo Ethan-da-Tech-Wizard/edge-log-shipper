@@ -447,8 +447,10 @@ class TestSyslogTransport(unittest.TestCase):
         self.assertTrue(success)
 
         transport.close()
-        server_sock.close()
+        # Join before closing the listener: closing it while the worker thread is
+        # still in accept() raised OSError there and made this test flaky.
         t.join(timeout=2.0)
+        server_sock.close()
 
         self.assertEqual(b"".join(received_data), test_payload)
 
@@ -673,10 +675,12 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
     # restart) replays the backlog and the spool drains to zero.
     def test_store_and_forward_failover_and_replay(self) -> None:
         # Step 1: Upstream server is completely down (unbound port)
-        # A fixed port that nothing listens on, later bound by the test server so the
-        # same target config works before and after the 'recovery'. Could collide if
-        # the port happens to be in use on the host.
-        dead_port = 54321
+        # Reserve a free port chosen by the OS (port 0) by binding without listen():
+        # connects are refused until listen() is called in step 2, and no other
+        # process can grab the port in between because we hold the bound socket.
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.bind(("127.0.0.1", 0))
+        dead_port = server_sock.getsockname()[1]
         config = ShipperConfig(
             target_host="127.0.0.1",
             target_port=dead_port,
@@ -697,8 +701,6 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
         shipper.close()
 
         # Step 2: Bring up the upstream TCP server on that port
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.bind(("127.0.0.1", dead_port))
         server_sock.listen(5)
 
         received_wire = []
