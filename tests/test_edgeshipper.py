@@ -454,6 +454,29 @@ class TestSyslogTransport(unittest.TestCase):
 
         self.assertEqual(b"".join(received_data), test_payload)
 
+    # Regression: the transport used AF_INET only, so an IPv6 collector could never
+    # be reached. Skipped when the host has no IPv6 loopback.
+    def test_tcp_transport_ipv6_target(self) -> None:
+        try:
+            server_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server_sock.bind(("::1", 0))
+        except OSError:
+            self.skipTest("IPv6 loopback unavailable")
+        server_sock.listen(1)
+        port = server_sock.getsockname()[1]
+        config = ShipperConfig(
+            target_host="::1", target_port=port, protocol="tcp",
+            connect_timeout=2.0, send_timeout=2.0,
+        )
+        transport = SyslogTransport(config)
+        try:
+            self.assertTrue(transport.connect())
+            conn, _ = server_sock.accept()
+            conn.close()
+        finally:
+            transport.close()
+            server_sock.close()
+
     # Loopback UDP receiver; a datagram must arrive as exactly one packet.
     def test_udp_transport_delivery(self) -> None:
         # Spin up a temporary local UDP receiver

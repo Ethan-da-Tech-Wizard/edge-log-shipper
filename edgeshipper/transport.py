@@ -135,6 +135,37 @@ class SyslogTransport:
             except OSError:
                 pass
 
+    def _connect_first_reachable(self, socktype: int, timeout: float) -> socket.socket:
+        """
+        Create a socket connected to the configured target, trying every address
+        that getaddrinfo returns (IPv4 and/or IPv6) until one succeeds.
+
+        Parameters:
+            socktype: socket.SOCK_STREAM (TCP) or socket.SOCK_DGRAM (UDP).
+            timeout: Timeout in seconds applied to the socket before connecting.
+
+        Returns:
+            A connected socket (caller owns it and must close it).
+
+        Raises:
+            OSError: If resolution fails or no address could be connected.
+        """
+        last_error: Optional[OSError] = None
+        for family, stype, proto, _canon, sockaddr in socket.getaddrinfo(
+            self.config.target_host, self.config.target_port, type=socktype
+        ):
+            candidate: Optional[socket.socket] = None
+            try:
+                candidate = socket.socket(family, stype, proto)
+                candidate.settimeout(timeout)
+                candidate.connect(sockaddr)
+                return candidate
+            except OSError as exc:
+                last_error = exc
+                if candidate is not None:
+                    candidate.close()
+        raise last_error if last_error is not None else OSError("no address for target host")
+
     # Step 1: Establish socket connection with configured timeout and socket options
     def connect(self) -> bool:
         """
@@ -150,22 +181,14 @@ class SyslogTransport:
         # file descriptors.
         self.close()
 
-        target = (self.config.target_host, self.config.target_port)
-
         # Held in a local until fully set up, so a failed connect can close it
         # without touching the previous (already closed) self._sock.
         sock: Optional[socket.socket] = None
         try:
             if self.config.protocol == "tcp":
-                # Create TCP stream socket
-                # IPv4 only (AF_INET); an IPv6-only collector address would fail to connect.
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Short connect timeout bounds how long an unreachable collector can stall
-                # the calling thread; it is swapped for the send timeout once connected.
-                sock.settimeout(self.config.connect_timeout)
-
-                # Connect to remote peer
-                sock.connect(target)
+                # Resolve with getaddrinfo so IPv4, IPv6 and hostnames all work; each
+                # candidate address is tried in order until one connects.
+                sock = self._connect_first_reachable(socket.SOCK_STREAM, self.config.connect_timeout)
 
                 # Apply performance socket options
                 self._configure_tcp_socket_options(sock)
@@ -182,11 +205,8 @@ class SyslogTransport:
                 # Create UDP datagram socket
                 # UDP: connect() sets a default peer and creates no handshake, so it
                 # succeeds even if nothing is listening; loss is invisible to us.
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(self.config.send_timeout)
-                # For UDP, socket.connect() associates the socket with the remote address,
-                # allowing use of send() instead of sendto() and filtering incoming ICMP errors.
-                sock.connect(target)
+                # Associating the peer also lets us use send() and receive ICMP errors.
+                sock = self._connect_first_reachable(socket.SOCK_DGRAM, self.config.send_timeout)
 
                 self._sock = sock
                 self._is_connected = True
