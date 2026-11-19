@@ -26,6 +26,9 @@ CLI WORKFLOWS & OPERATIONAL CAPABILITIES:
 
 # Postponed evaluation of annotations keeps the type hints below cheap and
 # allows the newer annotation syntax on the oldest supported Python (3.8).
+# Layout: build_parser() declares the subcommands, main() parses argv and dispatches to the
+# cmd_* handlers. Handlers return exit codes (never sys.exit) so tests call main() directly.
+# Run: python -m edgeshipper <command> --help    Test: python3 -m pytest -q
 from __future__ import annotations
 
 # Standard library only: the project is deliberately zero-dependency so it can
@@ -45,7 +48,15 @@ from edgeshipper.tailer import FileTailer, StdinTailer
 # The parser is built in a function (not at import time) so tests can call
 # main() repeatedly with different argv lists and get a fresh parser each time.
 def build_parser() -> argparse.ArgumentParser:
-    """Construct command-line argument parser with subcommands and flags."""
+    """Construct the argparse parser with the send/tail/spool-status/flush/purge subcommands.
+
+    Called by main() on every invocation (and by tests), so it has no side effects.
+    The networking flags live in the nested add_common_flags helper and are shared by
+    every command that can reach a collector.
+
+    Returns:
+        The configured ArgumentParser; the chosen subcommand ends up in args.command.
+    """
     parser = argparse.ArgumentParser(
         prog="edgeshipper",
         description="Zero-dependency edge log streaming daemon with store-and-forward spooling.",
@@ -201,9 +212,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def create_config_from_args(args: argparse.Namespace) -> ShipperConfig:
-    """Map parsed CLI namespace arguments into typed ShipperConfig dataclass."""
+    """Map a parsed CLI namespace onto a typed ShipperConfig.
+
+    Args:
+        args: Namespace from build_parser() for send, tail or flush (needs host, port,
+            protocol, syslog_format, framing, spool_dir, app_name, facility, severity).
+
+    Returns:
+        A ShipperConfig with numeric facility/severity codes and sanitize inverted from
+        --no-sanitize.
+
+    Raises:
+        ValueError: If --facility or --severity is neither a known name nor in range
+            (raised by parse_facility / parse_severity).
+    """
     # Facility/severity accept either a symbolic name or a number; parse_*
     # validates them and returns the numeric code stored in the config.
+    # Numeric codes (not names) are what the RFC 5424 priority value is built from.
     facility_code = parse_facility(args.facility)
     severity_code = parse_severity(args.severity)
 
@@ -224,12 +249,21 @@ def create_config_from_args(args: argparse.Namespace) -> ShipperConfig:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
-    """Execute 'send' subcommand."""
+    """Run `send`: ship one message, spooling it locally if the collector is down.
+
+    Args:
+        args: Parsed namespace including message plus the common networking flags.
+
+    Returns:
+        0 if the message was delivered or safely spooled, 1 if it could neither be
+        sent nor spooled. Side effects: opens a socket and the spool directory.
+    """
     config = create_config_from_args(args)
     # The shipper owns sockets and spool file handles; every command below closes
     # it in a finally block so resources are released on any exit path.
     shipper = EdgeShipper(config)
     try:
+        # On send failure the message goes to the spool, so False here means both the network and the disk spool failed.
         success = shipper.ship_message(args.message)
         if success:
             # ship_message returns True both when delivered and when safely spooled, so
@@ -248,7 +282,15 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
-    """Execute 'tail' subcommand."""
+    """Run `tail`: stream a file (or stdin) to the collector until EOF or Ctrl-C.
+
+    Args:
+        args: Parsed namespace with file, no_follow, from_start, poll_interval and the
+            common networking flags.
+
+    Returns:
+        0 on normal completion or Ctrl-C. Blocks for the life of the stream in follow mode.
+    """
     config = create_config_from_args(args)
     shipper = EdgeShipper(config)
 
@@ -256,12 +298,14 @@ def cmd_tail(args: argparse.Namespace) -> int:
         # With --file we tail a path; otherwise fall back to reading stdin (pipes).
         if args.file:
             print(f"[edgeshipper] Tailing file: {args.file} -> {config.protocol.upper()}://{config.target_host}:{config.target_port}")
+            # follow/start_at_end are inverted CLI flags: the default is `tail -f` behaviour (start at EOF, keep following).
             tailer = FileTailer(
                 filepath=args.file,
                 follow=not args.no_follow,
                 start_at_end=not args.from_start,
                 poll_interval=args.poll_interval,
             )
+            # run_stream consumes the generator, shipping each line and spooling on failure; it only returns when the stream ends.
             shipper.run_stream(tailer.tail())
         else:
             print(f"[edgeshipper] Streaming from stdin -> {config.protocol.upper()}://{config.target_host}:{config.target_port}")
@@ -278,7 +322,15 @@ def cmd_tail(args: argparse.Namespace) -> int:
 
 
 def cmd_spool_status(args: argparse.Namespace) -> int:
-    """Execute 'spool-status' subcommand."""
+    """Run `spool-status`: print queue depth, disk use and counters (read-only, no network).
+
+    Args:
+        args: Parsed namespace with spool_dir and optional json flag.
+
+    Returns:
+        Always 0.
+    """
+    # Opening the queue re-reads the journal, so the numbers reflect what a daemon restart would recover.
     spooler = SpoolQueue(spool_dir=args.spool_dir)
     stat = spooler.status()
 
@@ -298,10 +350,19 @@ def cmd_spool_status(args: argparse.Namespace) -> int:
 
 
 def cmd_flush(args: argparse.Namespace) -> int:
-    """Execute 'flush' subcommand."""
+    """Run `flush`: manually replay everything in the spool to the collector.
+
+    Args:
+        args: Parsed namespace with batch_size and the common networking flags.
+
+    Returns:
+        Always 0, even if the collector is down (records then simply stay spooled and
+        the remaining count is printed).
+    """
     config = create_config_from_args(args)
     shipper = EdgeShipper(config)
     try:
+        # batch_size bounds memory per round; the loop below keeps going until the spool is empty or upstream stops accepting.
         print(f"[edgeshipper] Flushing spool buffer to {config.target_host}:{config.target_port}...")
         # Drain in batches until flush_spool reports zero. It returns 0 either when
         # the spool is empty or when upstream is still unreachable, so the loop ends
@@ -321,7 +382,17 @@ def cmd_flush(args: argparse.Namespace) -> int:
 
 
 def cmd_purge(args: argparse.Namespace) -> int:
-    """Execute 'purge' subcommand."""
+    """Run `purge`: permanently delete every spooled record and reset counters.
+
+    Destructive and not reversible; there is deliberately no confirmation prompt so it
+    can be used from scripts.
+
+    Args:
+        args: Parsed namespace with spool_dir.
+
+    Returns:
+        Always 0.
+    """
     spooler = SpoolQueue(spool_dir=args.spool_dir)
     spooler.purge()
     print(f"[edgeshipper] Purged all records in spool directory: {args.spool_dir}")
@@ -330,7 +401,14 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
 # argv is injectable for tests; None makes argparse read sys.argv[1:].
 def main(argv: Optional[List[str]] = None) -> int:
-    """Entry point for CLI execution."""
+    """CLI entry point (`python -m edgeshipper` and the console script).
+
+    Args:
+        argv: Argument list to parse; None means sys.argv[1:].
+
+    Returns:
+        The selected subcommand's exit code; 1 if no handler matched.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
 
