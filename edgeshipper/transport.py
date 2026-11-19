@@ -43,7 +43,7 @@ LOW-LEVEL NETWORK & SOCKET PROGRAMMING CONCEPTS:
    of edge log shippers simultaneously attempt reconnection. If they retry at deterministic
    intervals, they create a devastating "Thundering Herd" DDoS against the syslog server.
    We implement Full Jitter backoff (pioneered by AWS Architecture):
-       sleep_interval = random.uniform(0, min(max_backoff, base * (multiplier ** attempt)))
+       sleep_interval = random.uniform(0.1, max(0.2, min(max_backoff, base * (multiplier ** attempt))))
    This decorrelates client retry cycles across the entire fleet.
 
 5. UDP vs TCP Delivery Semantics:
@@ -235,7 +235,12 @@ class SyslogTransport:
 
         Formula:
             ceiling = min(max_backoff, initial * (multiplier ** attempts))
-            sleep_duration = random.uniform(0, ceiling)
+            sleep_duration = random.uniform(0.1, max(0.2, ceiling))
+
+        The 0.1s lower bound keeps the delay from collapsing to ~0 (a tight retry
+        loop); max(0.2, ...) keeps the interval non-empty when ceiling is tiny.
+        Pure calculation: nothing in the shipper calls this yet, so callers that
+        want backoff must sleep for the returned value themselves.
 
         Returns:
             Float number of seconds to sleep before retry.
@@ -249,7 +254,7 @@ class SyslogTransport:
 
         ceiling = min(cap, base * (mult ** attempt))
         # Full jitter with a small floor (0.1s) so the delay is never ~0. Note this
-        # differs slightly from the docstring formula, which shows a lower bound of 0.
+        # differs from textbook full jitter, whose lower bound is 0 (see docstring).
         # This method only computes the delay; callers decide whether to sleep.
         return random.uniform(0.1, max(0.2, ceiling))
 
