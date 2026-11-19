@@ -205,6 +205,7 @@ class TestSyslogModels(unittest.TestCase):
 class TestLogSanitizer(unittest.TestCase):
     """Test suite for CWE-117 log injection and ANSI terminal scrubbing."""
 
+    # Fresh sanitizer with default limits; it is stateless, so one per test is enough.
     def setUp(self) -> None:
         self.sanitizer = LogSanitizer()
 
@@ -272,6 +273,8 @@ class TestSpoolQueue(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_spool_")
 
+    # ignore_errors: a spool file still held open by a failed test must not mask the
+    # original failure with a cleanup error.
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
@@ -334,6 +337,8 @@ class TestSpoolQueue(unittest.TestCase):
         messages_per_thread = 50
         num_threads = 4
 
+        # Worker body for each enqueue thread; the thread index is embedded in the message
+        # so a lost or duplicated line can be identified.
         def worker(thread_idx: int):
             for i in range(messages_per_thread):
                 queue.enqueue(LogMessage(message=f"Thread {thread_idx} - Msg {i}"))
@@ -414,6 +419,8 @@ class TestSyslogTransport(unittest.TestCase):
 
         received_data = []
 
+        # Server thread: accepts one connection and appends everything received to a
+        # shared list, so the test can compare the wire bytes after the client closes.
         def accept_worker():
             try:
                 conn, _ = server_sock.accept()
@@ -486,6 +493,8 @@ class TestSyslogTransport(unittest.TestCase):
 
         received_packets = []
 
+        # Receiver thread with a 2s timeout: a dropped datagram ends the thread instead of
+        # hanging the test run.
         def udp_worker():
             try:
                 server_sock.settimeout(2.0)
@@ -534,10 +543,13 @@ class TestSyslogTransport(unittest.TestCase):
 class TestFileTailer(unittest.TestCase):
     """Test suite for POSIX file tailing, rotation, and truncation handling."""
 
+    # Each test gets its own temp directory so rotation tests (which rename and
+    # truncate app.log) cannot affect each other.
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_tailer_")
         self.log_file = Path(self.test_dir) / "app.log"
 
+    # Removes the whole temp tree, including rotated copies such as app.log.1.
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
@@ -572,6 +584,8 @@ class TestFileTailer(unittest.TestCase):
 
         collected = []
 
+        # Runs the blocking tail() generator in a background thread, stopping after 3
+        # lines so the generator exits and the thread can be joined.
         def worker():
             for line in tailer.tail():
                 collected.append(line)
@@ -608,6 +622,7 @@ class TestFileTailer(unittest.TestCase):
 
         collected = []
 
+        # Same pattern, stopping after 2 lines (one from each side of the rotation).
         def worker():
             for line in tailer.tail():
                 collected.append(line)
@@ -657,6 +672,8 @@ class TestFileTailer(unittest.TestCase):
         )
         collected = []
 
+        # Stops after the first complete line, which only appears once the buffered
+        # fragment is finished.
         def worker():
             for line in tailer.tail():
                 collected.append(line)
@@ -687,9 +704,11 @@ class TestFileTailer(unittest.TestCase):
 class TestEdgeShipperEndToEnd(unittest.TestCase):
     """End-to-end integration tests for store-and-forward spool replay."""
 
+    # Separate spool/log directory per test so replay assertions count only this test's records.
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_e2e_")
 
+    # Cleanup tolerates files left open by daemon threads on failure.
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
@@ -728,6 +747,8 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
 
         received_wire = []
 
+        # Fake upstream syslog server started AFTER the first send failed. The timeouts
+        # keep a failing test from blocking forever.
         def server_thread():
             server_sock.settimeout(4.0)
             try:
@@ -767,9 +788,12 @@ class TestEdgeShipperEndToEnd(unittest.TestCase):
 class TestCliInterface(unittest.TestCase):
     """Test suite for CLI command dispatch and argument handling."""
 
+    # Temp spool directory handed to the CLI via --spool-dir, keeping the real
+    # default spool path untouched.
     def setUp(self) -> None:
         self.test_dir = tempfile.mkdtemp(prefix="test_cli_")
 
+    # Cleanup tolerates already-removed paths (purge test deletes spool files).
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
